@@ -3,7 +3,7 @@
  * @brief MNIST手写数字识别示例
  *
  * @使用方法:
- * ./mnist_demo <model_path> <input_image_path>
+ * ./mnist_demo <model_path> [input_image_path] [iterations] [threads]
  */
 
 #include "microflow/runtime.hpp"
@@ -148,12 +148,13 @@ void run_inference_benchmark(InferenceEngine& engine,
                             const Tensor& input,
                             int iterations)
 {
+    Tensor output({10});
     std::cout << "\n  Running " << iterations
               << " inference iterations...\n\n";
 
     // 预热
     for (int i = 0; i < 3; ++i) {
-        engine.infer(input);
+        engine.infer_into(input, output);
     }
 
     // 重置统计
@@ -163,7 +164,7 @@ void run_inference_benchmark(InferenceEngine& engine,
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        engine.infer(input);
+        engine.infer_into(input, output);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -192,16 +193,19 @@ int main(int argc, char** argv) {
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════╗\n";
     std::cout << "║     MicroFlow MNIST Inference Demo        ║\n";
-    std::cout << "║     Raspberry Pi 4 Optimized              ║\n";
+    std::cout << "║     ARM64 / ROCK 4D Optimized             ║\n";
     std::cout << "╚════════════════════════════════════════════╝\n";
     std::cout << "\n";
 
     // 检查命令行参数
-    if (argc < 2) {
-        std::cout << "Usage: " << argv[0] << " <model_path> [image_path]\n\n";
+    if (argc < 2 || argc > 5) {
+        std::cout << "Usage: " << argv[0]
+                  << " <model_path> [image_path] [iterations] [threads]\n\n";
         std::cout << "Arguments:\n";
         std::cout << "  model_path  - Path to .mflow model file\n";
         std::cout << "  image_path  - Path to MNIST image file (optional)\n\n";
+        std::cout << "  iterations  - Benchmark iterations (default: 100)\n";
+        std::cout << "  threads     - Inference threads (default: 4)\n\n";
         std::cout << "Example:\n";
         std::cout << "  " << argv[0] << " model/mnist.mflow input/sample3.bin\n\n";
         return 1;
@@ -209,11 +213,24 @@ int main(int argc, char** argv) {
 
     std::string model_path = argv[1];
     std::string image_path = (argc > 2) ? argv[2] : "";
+    int iterations = 100;
+    int threads = 4;
+    try {
+        if (argc > 3) iterations = std::stoi(argv[3]);
+        if (argc > 4) threads = std::stoi(argv[4]);
+    } catch (const std::exception&) {
+        std::cerr << "Error: iterations and threads must be integers\n";
+        return 2;
+    }
+    if (iterations < 1 || threads < 1 || threads > 64) {
+        std::cerr << "Error: iterations must be positive and threads must be 1..64\n";
+        return 2;
+    }
 
     // 创建推理引擎
     std::cout << "Initializing inference engine...\n";
     InferenceEngine::Config config;
-    config.num_threads = 4;
+    config.num_threads = threads;
     config.enable_profiling = true;
     InferenceEngine engine(config);
 
@@ -257,13 +274,14 @@ int main(int argc, char** argv) {
 
     // 执行推理
     std::cout << "Running inference...\n";
-    Tensor output = engine.infer(input);
+    Tensor output({10});
+    engine.infer_into(input, output);
 
     // 打印结果
     print_prediction(output);
 
     // 性能测试
-    run_inference_benchmark(engine, input, 100);
+    run_inference_benchmark(engine, input, iterations);
 
     std::cout << "Demo completed successfully!\n\n";
 
@@ -275,7 +293,7 @@ int main(int argc, char** argv) {
  *
  * @section intro Introduction
  * MicroFlow is a lightweight neural network inference engine optimized
- * for Raspberry Pi 4 (Cortex-A72 ARM64 architecture).
+ * for ROCK 4D Cortex-A72 big cores (ARM64 architecture).
  *
  * @section features Features
  * - ARM NEON optimized kernels

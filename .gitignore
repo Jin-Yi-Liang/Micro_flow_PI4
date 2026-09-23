@@ -43,6 +43,8 @@ models/*.mflow
 image/*.bin
 !image/*.bin
 data/MNIST/
+benchmarks/ncnn/mnist_improved.param
+benchmarks/ncnn/mnist_improved.bin
 
 # ==========================================
 # 5. 编辑器与系统临时文件

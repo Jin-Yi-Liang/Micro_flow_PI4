@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <fstream>
 
@@ -198,9 +199,12 @@ public:
 public:
     std::string name_;
     Tensor kernel_;
+    Tensor winograd_kernel_;
     Tensor bias_;
     Conv2DParams params_;
     size_t workspace_size_;
+    bool fuse_relu_ = false;
+    bool fuse_maxpool_ = false;
 };
 
 /**
@@ -341,7 +345,14 @@ public:
 public:
     std::string name_;
     Tensor weight_;
+    Tensor packed_weight_;
+    std::vector<int8_t> quantized_weight_;
+    std::vector<float> quantized_weight_scales_;
+    std::vector<int32_t> quantized_weight_sums_;
+    std::vector<int8_t> quantized_input_;
     Tensor bias_;
+    bool fuse_relu_ = false;
+    bool dynamic_quantization_enabled_ = true;
 };
 
 /**
@@ -545,6 +556,9 @@ public:
      */
     void fuse_layers();
 
+    /** Enable or disable dynamic-int8 fully connected kernels. */
+    void set_dynamic_quantization(bool enabled);
+
     std::vector<std::unique_ptr<Layer>> layers_;
     std::unordered_map<std::string, Layer*> layer_map_;
 
@@ -728,6 +742,11 @@ public:
     Tensor infer(const Tensor& input);
 
     /**
+     * @brief Infer into a caller-owned output tensor to avoid per-call allocation.
+     */
+    void infer_into(const Tensor& input, Tensor& output);
+
+    /**
      * @brief 批量推理
      */
     std::vector<Tensor> infer_batch(const std::vector<Tensor>& inputs);
@@ -764,6 +783,7 @@ public:
     // 性能统计
     Stats stats_;
     std::vector<double> inference_times_;
+    mutable std::mutex inference_mutex_;
 };
 
 //==========================================================================

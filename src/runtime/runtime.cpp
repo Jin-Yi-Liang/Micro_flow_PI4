@@ -3,6 +3,9 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <omp.h>
 
 namespace microflow {
 
@@ -42,8 +45,15 @@ Conv2DLayer::Conv2DLayer(const std::string& name,
     , params_(params)
     , workspace_size_(0)
 {
-    workspace_size_ = compute_conv_workspace_size(
-        Tensor({1, 28, 28}), kernel_, params_);
+    if (params_.kernel_size == 3 && params_.stride == 1 && params_.padding == 1 &&
+        kernel_.ndim() == 4) {
+        winograd_kernel_ = Tensor({kernel_.shapes()[0], kernel_.shapes()[1], 16});
+        winograd_transform_kernel_3x3(kernel_, winograd_kernel_);
+        // The bundled MNIST network never exceeds 28x28. One transformed
+        // 4x4 tile is stored per input channel and 2x2 output block.
+        workspace_size_ = static_cast<size_t>(kernel_.shapes()[1]) * 16 * 14 * 14 *
+                          sizeof(float);
+    }
 }
 
 void Conv2DLayer::forward(const std::vector<Tensor*>& inputs,
@@ -51,10 +61,13 @@ void Conv2DLayer::forward(const std::vector<Tensor*>& inputs,
                          float* workspace)
 {
     if (inputs.empty() || outputs.empty()) return;
-    // 标准版本：Conv2D + Bias
-    // 注意：即使fuse_relu_=true，我们也在这里统一处理
-    // 真正的融合优化需要修改conv2d内部实现来在bias后立即应用ReLU
-    conv2d(*inputs[0], kernel_, bias_, *outputs[0], params_, workspace);
+    if (winograd_kernel_.is_valid() && workspace != nullptr) {
+        conv2d_winograd_f2x2(*inputs[0], winograd_kernel_, bias_, *outputs[0],
+                             fuse_relu_, workspace, fuse_maxpool_);
+    } else {
+        conv2d(*inputs[0], kernel_, bias_, *outputs[0], params_, workspace);
+        if (fuse_relu_) relu(*outputs[0]);
+    }
 }
 
 size_t Conv2DLayer::workspace_size() const {
@@ -73,6 +86,10 @@ std::vector<uint32_t> Conv2DLayer::output_shape(
     int F = kernel_.shapes()[0];
     int H_out = (H + 2 * params_.padding - K) / params_.stride + 1;
     int W_out = (W + 2 * params_.padding - K) / params_.stride + 1;
+    if (fuse_maxpool_) {
+        H_out /= 2;
+        W_out /= 2;
+    }
     return {static_cast<uint32_t>(F), static_cast<uint32_t>(H_out),
             static_cast<uint32_t>(W_out)};
 }
@@ -245,6 +262,46 @@ LinearLayer::LinearLayer(const std::string& name,
                         const Tensor& bias)
     : name_(name), weight_(weight), bias_(bias)
 {
+    if (weight_.ndim() == 2) {
+        // Model files store [in, out]. Pack once into [out, in] so batch-one
+        // inference can stream each neuron's weights contiguously.
+        packed_weight_ = weight_.transpose(0, 1);
+        const uint32_t out_features = packed_weight_.shapes()[0];
+        const uint32_t in_features = packed_weight_.shapes()[1];
+        if (in_features >= 512) {
+            constexpr uint32_t block_size = 64;
+            const uint32_t blocks = (in_features + block_size - 1) / block_size;
+            quantized_weight_.resize(packed_weight_.size());
+            quantized_weight_scales_.resize(static_cast<size_t>(out_features) * blocks);
+            quantized_weight_sums_.resize(static_cast<size_t>(out_features) * blocks);
+            quantized_input_.resize(in_features);
+            for (uint32_t output_index = 0; output_index < out_features; ++output_index) {
+                const float* row = packed_weight_.raw_ptr() +
+                    static_cast<size_t>(output_index) * in_features;
+                for (uint32_t block = 0; block < blocks; ++block) {
+                    const uint32_t begin = block * block_size;
+                    const uint32_t end = std::min(begin + block_size, in_features);
+                    float maximum = 0.0f;
+                    for (uint32_t i = begin; i < end; ++i) {
+                        maximum = std::max(maximum, std::abs(row[i]));
+                    }
+                    const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+                    const size_t scale_index =
+                        static_cast<size_t>(output_index) * blocks + block;
+                    quantized_weight_scales_[scale_index] = scale;
+                    int32_t weight_sum = 0;
+                    for (uint32_t i = begin; i < end; ++i) {
+                        const int8_t quantized =
+                            static_cast<int8_t>(std::lrint(row[i] / scale));
+                        quantized_weight_[static_cast<size_t>(output_index) * in_features + i] =
+                            quantized;
+                        weight_sum += quantized;
+                    }
+                    quantized_weight_sums_[scale_index] = weight_sum;
+                }
+            }
+        }
+    }
 }
 
 void LinearLayer::forward(const std::vector<Tensor*>& inputs,
@@ -252,7 +309,20 @@ void LinearLayer::forward(const std::vector<Tensor*>& inputs,
                          float* workspace)
 {
     if (inputs.empty() || outputs.empty()) return;
-    linear(*inputs[0], weight_, bias_, *outputs[0]);
+    const Tensor& input = *inputs[0];
+    if (input.ndim() == 1 && dynamic_quantization_enabled_ &&
+        !quantized_weight_.empty() &&
+        packed_weight_.shapes()[1] == input.size()) {
+        gemv_int8_dynamic(input, quantized_weight_, quantized_weight_scales_,
+                          quantized_weight_sums_, bias_,
+                          *outputs[0], fuse_relu_, quantized_input_);
+    } else if (input.ndim() == 1 && packed_weight_.is_valid() &&
+        packed_weight_.shapes()[1] == input.size()) {
+        gemv_packed(input, packed_weight_, bias_, *outputs[0], fuse_relu_);
+    } else {
+        linear(input, weight_, bias_, *outputs[0]);
+        if (fuse_relu_) relu(*outputs[0]);
+    }
 }
 
 std::vector<uint32_t> LinearLayer::output_shape(
@@ -307,7 +377,7 @@ void FlattenLayer::forward(const std::vector<Tensor*>& inputs,
     float* workspace)
 {
     if (inputs.empty() || outputs.empty()) return;
-    std::memcpy(outputs[0]->raw_ptr(), inputs[0]->raw_ptr(), inputs[0]->size() * sizeof(float));
+    outputs[0]->set_view_of(*inputs[0], {inputs[0]->size()});
 }
 
 std::vector<uint32_t> FlattenLayer::output_shape(
@@ -351,18 +421,48 @@ std::vector<uint32_t> SoftmaxLayer::output_shape(
 // 模型实现
 //==========================================================================
 
-static Tensor read_tensor_from_file(std::ifstream& file) {
+static bool read_tensor_from_file(std::ifstream& file, Tensor& tensor,
+                                  std::string& error) {
     TensorDesc desc;
     file.read(reinterpret_cast<char*>(&desc), sizeof(TensorDesc));
-    std::vector<uint32_t> shape;
-    for (uint32_t i = 0; i < desc.ndim; ++i) {
-        shape.push_back(desc.shapes[i]);
+    if (!file) {
+        error = "truncated tensor descriptor";
+        return false;
     }
-    Tensor tensor(shape);
+    if (desc.ndim == 0 || desc.ndim > 4) {
+        error = "tensor rank must be between 1 and 4";
+        return false;
+    }
+    if (desc.dtype != DataType::kFloat32) {
+        error = "only float32 tensors are supported";
+        return false;
+    }
+
+    std::vector<uint32_t> shape;
+    uint64_t element_count = 1;
+    for (uint32_t i = 0; i < desc.ndim; ++i) {
+        if (desc.shapes[i] == 0 ||
+            element_count > std::numeric_limits<uint32_t>::max() / desc.shapes[i]) {
+            error = "invalid or overflowing tensor shape";
+            return false;
+        }
+        shape.push_back(desc.shapes[i]);
+        element_count *= desc.shapes[i];
+    }
+    if (element_count != desc.size) {
+        error = "tensor element count does not match its shape";
+        return false;
+    }
+
+    tensor = Tensor(shape);
     if (desc.size > 0) {
         file.read(reinterpret_cast<char*>(tensor.raw_ptr()), desc.size * sizeof(float));
+        if (!file) {
+            error = "truncated tensor data";
+            return false;
+        }
     }
-    return tensor;
+    return true;
 }
 
 Model::Model() : is_loaded_(false) {}
@@ -370,20 +470,51 @@ Model::Model() : is_loaded_(false) {}
 Model::~Model() = default;
 
 bool Model::load(const std::string& path) {
+    is_loaded_ = false;
+    layers_.clear();
+    layer_map_.clear();
+    intermediate_tensors_.clear();
+    workspace_.clear();
+    input_shape_.clear();
+    output_shape_.clear();
+
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return false;
-    ModelHeader header;
+    if (!file.is_open()) {
+        std::cerr << "Error: Cannot open model file: " << path << "\n";
+        return false;
+    }
+
+    const auto fail = [&](const std::string& message) {
+        std::cerr << "Error: Invalid model file '" << path << "': " << message << "\n";
+        layers_.clear();
+        layer_map_.clear();
+        intermediate_tensors_.clear();
+        workspace_.clear();
+        input_shape_.clear();
+        output_shape_.clear();
+        return false;
+    };
+
+    ModelHeader header{};
     file.read(reinterpret_cast<char*>(&header), sizeof(ModelHeader));
-    if (header.magic != MFLOW_MAGIC) return false;
-    std::cout << "Loading model: " << header.description << "\n";
+    if (!file) return fail("truncated header");
+    if (header.magic != MFLOW_MAGIC) return fail("bad magic number");
+    if (header.version != 2) return fail("unsupported format version " + std::to_string(header.version));
+    if (header.num_layers == 0 || header.num_layers > 1024) {
+        return fail("invalid layer count " + std::to_string(header.num_layers));
+    }
+    const size_t description_length = strnlen(header.description, sizeof(header.description));
+    std::cout << "Loading model: "
+              << std::string(header.description, description_length) << "\n";
     std::cout << "  Layers: " << header.num_layers << "\n";
     std::cout << "  Tensors: " << header.num_tensors << "\n";
     std::cout << "  Data offset: " << header.data_offset << "\n";
     input_shape_ = {1, 28, 28};
     bool has_softmax = false;
     for (uint32_t i = 0; i < header.num_layers; ++i) {
-        LayerHeader lh;
+        LayerHeader lh{};
         file.read(reinterpret_cast<char*>(&lh), sizeof(LayerHeader));
+        if (!file) return fail("truncated layer header at index " + std::to_string(i));
         std::cout << "  Layer " << i << ": type=" << static_cast<uint32_t>(lh.type) << " (";
 
         // 打印层类型名称
@@ -399,7 +530,15 @@ bool Model::load(const std::string& path) {
             add_layer(std::make_unique<InputLayer>("input", input_shape_));
         }
         else if (lh.type == LayerType::kConv2D) {
-            Tensor kernel = read_tensor_from_file(file);
+            Tensor kernel;
+            std::string tensor_error;
+            if (!read_tensor_from_file(file, kernel, tensor_error)) {
+                return fail("layer " + std::to_string(i) + " kernel: " + tensor_error);
+            }
+            if (kernel.shapes().size() != 4 || kernel.shapes()[2] != 3 ||
+                kernel.shapes()[3] != 3) {
+                return fail("layer " + std::to_string(i) + " has an unsupported convolution kernel");
+            }
             std::cout << "    Kernel shape: [";
             for (size_t i = 0; i < kernel.shapes().size(); ++i) {
                 std::cout << kernel.shapes()[i];
@@ -407,7 +546,13 @@ bool Model::load(const std::string& path) {
             }
             std::cout << "]\n";
 
-            Tensor bias = read_tensor_from_file(file);
+            Tensor bias;
+            if (!read_tensor_from_file(file, bias, tensor_error)) {
+                return fail("layer " + std::to_string(i) + " bias: " + tensor_error);
+            }
+            if (bias.shapes().size() != 1 || bias.size() != kernel.shapes()[0]) {
+                return fail("layer " + std::to_string(i) + " convolution bias shape mismatch");
+            }
             std::cout << "    Bias shape: [";
             for (size_t i = 0; i < bias.shapes().size(); ++i) {
                 std::cout << bias.shapes()[i];
@@ -431,14 +576,27 @@ bool Model::load(const std::string& path) {
             add_layer(std::make_unique<FlattenLayer>("flatten_" + std::to_string(i)));
         }
         else if (lh.type == LayerType::kLinear) {
-            Tensor weight = read_tensor_from_file(file);
+            Tensor weight;
+            std::string tensor_error;
+            if (!read_tensor_from_file(file, weight, tensor_error)) {
+                return fail("layer " + std::to_string(i) + " weight: " + tensor_error);
+            }
+            if (weight.shapes().size() != 2) {
+                return fail("layer " + std::to_string(i) + " linear weight must be two-dimensional");
+            }
             std::cout << "    Weight shape: [";
             for (size_t i = 0; i < weight.shapes().size(); ++i) {
                 std::cout << weight.shapes()[i];
                 if (i < weight.shapes().size() - 1) std::cout << ", ";
             }
             std::cout << "]\n";
-            Tensor bias = read_tensor_from_file(file);
+            Tensor bias;
+            if (!read_tensor_from_file(file, bias, tensor_error)) {
+                return fail("layer " + std::to_string(i) + " bias: " + tensor_error);
+            }
+            if (bias.shapes().size() != 1 || bias.size() != weight.shapes()[1]) {
+                return fail("layer " + std::to_string(i) + " linear bias shape mismatch");
+            }
             std::cout << "    Bias shape: [";
             for (size_t i = 0; i < bias.shapes().size(); ++i) {
                 std::cout << bias.shapes()[i];
@@ -461,6 +619,11 @@ bool Model::load(const std::string& path) {
                 add_layer(std::make_unique<SoftmaxLayer>("softmax_" + std::to_string(i)));
             }
         }
+        else {
+            return fail("unsupported layer type " +
+                        std::to_string(static_cast<uint32_t>(lh.type)) +
+                        " at index " + std::to_string(i));
+        }
     }
     // Auto-append softmax if not present
     if (!has_softmax) {
@@ -468,8 +631,7 @@ bool Model::load(const std::string& path) {
         std::cout << "Auto-added Softmax layer for probability output\n";
     }
 
-    // 注意：层融合优化已禁用
-    // 真正的融合需要在conv2d/linear内核中实现，以避免额外的内存访问
+    fuse_layers();
 
     is_loaded_ = true;
 
@@ -559,102 +721,68 @@ Layer* Model::get_layer(const std::string& name) {
 // 关键修复：不使用 push_back，直接通过 intermediate_tensors_ 传递数据
 void Model::forward(const Tensor& input, Tensor& output) {
     if (!is_loaded_ || layers_.empty()) {
-        std::cerr << "ERROR: Model not loaded or has no layers!\n";
-        return;
+        throw std::runtime_error("Model is not loaded");
     }
     if (intermediate_tensors_.empty()) allocate_tensors();
     if (workspace_.empty()) {
         workspace_.resize(compute_workspace_size() / sizeof(float) + 1024);
     }
     if (!input.is_valid()) {
-        std::cerr << "ERROR: Input tensor is invalid!\n";
-        return;
+        throw std::invalid_argument("Input tensor is invalid");
     }
     if (input.shapes() != input_shape_) {
-        std::cerr << "ERROR: Input shape mismatch!\n";
-        return;
+        throw std::invalid_argument("Input tensor shape mismatch");
+    }
+    if (!output.is_valid() || output.shapes() != output_shape_) {
+        throw std::invalid_argument("Output tensor shape mismatch");
     }
 
-    static bool debug_enabled = false;  // Set to true for debugging
-
-    // 第一层：input -> intermediate_tensors_[0]
-    // 使用指针向量避免深拷贝
-    std::vector<Tensor*> in_vec = {const_cast<Tensor*>(&input)};
-    std::vector<Tensor*> out_vec = {&intermediate_tensors_[0]};
-    layers_[0]->forward(in_vec, out_vec, workspace_.data());
-
-    if (debug_enabled) {
-        // Print stats after first conv layer
-        std::cout << "\n=== Layer 1 (Conv2D) output stats ===\n";
-        const float* ptr = intermediate_tensors_[1].raw_ptr();  // After Conv2D
-        float min_val = ptr[0], max_val = ptr[0];
-        float sum = 0;
-        for (size_t i = 0; i < intermediate_tensors_[1].size(); ++i) {
-            if (ptr[i] < min_val) min_val = ptr[i];
-            if (ptr[i] > max_val) max_val = ptr[i];
-            sum += ptr[i];
+    const size_t first_compute_layer =
+        layers_[0]->type() == LayerType::kInput ? 1 : 0;
+    const auto execute_layers = [&]() {
+        // InputLayer is metadata only. Feed the caller-owned tensor directly
+        // to the first compute layer instead of copying all input values.
+        std::vector<Tensor*> in_vec = {const_cast<Tensor*>(&input)};
+        std::vector<Tensor*> out_vec;
+        for (size_t i = first_compute_layer; i < layers_.size(); ++i) {
+            if (i != first_compute_layer) {
+                in_vec = {&intermediate_tensors_[i - 1]};
+            }
+            out_vec = {&intermediate_tensors_[i]};
+            layers_[i]->forward(in_vec, out_vec, workspace_.data());
         }
-        std::cout << "  Min: " << min_val << ", Max: " << max_val << ", Mean: " << sum / intermediate_tensors_[1].size() << "\n";
-        std::cout << "  First 5 values: [" << ptr[0] << ", " << ptr[1] << ", " << ptr[2] << ", " << ptr[3] << ", " << ptr[4] << "]\n";
+    };
+
+    bool used_dynamic_quantization = false;
+    for (const auto& layer : layers_) {
+        if (const auto* linear_layer = dynamic_cast<const LinearLayer*>(layer.get())) {
+            used_dynamic_quantization |= linear_layer->dynamic_quantization_enabled_ &&
+                                         !linear_layer->quantized_weight_.empty();
+        }
     }
 
-    // 后续层：intermediate_tensors_[i-1] -> intermediate_tensors_[i]
-    for (size_t i = 1; i < layers_.size(); ++i) {
-        in_vec = {&intermediate_tensors_[i-1]};
-        out_vec = {&intermediate_tensors_[i]};
-        layers_[i]->forward(in_vec, out_vec, workspace_.data());
+    execute_layers();
 
-        if (debug_enabled && i == 8) {
-            // Print stats after first Linear layer (Layer 8)
-            std::cout << "\n=== Layer " << i << " (Linear 3136->128) output stats ===\n";
-            const float* ptr = intermediate_tensors_[i].raw_ptr();
-            float min_val = ptr[0], max_val = ptr[0];
-            float sum = 0;
-            for (size_t j = 0; j < intermediate_tensors_[i].size(); ++j) {
-                if (ptr[j] < min_val) min_val = ptr[j];
-                if (ptr[j] > max_val) max_val = ptr[j];
-                sum += ptr[j];
+    // Dynamic INT8 is used only for the large hidden fully connected layer.
+    // Near a decision boundary, rerun in FP32 to preserve the reference
+    // model's classification. The threshold is on final softmax margin.
+    if (used_dynamic_quantization && intermediate_tensors_.back().size() >= 2) {
+        const float* probabilities = intermediate_tensors_.back().raw_ptr();
+        float first = -std::numeric_limits<float>::infinity();
+        float second = -std::numeric_limits<float>::infinity();
+        for (uint32_t i = 0; i < intermediate_tensors_.back().size(); ++i) {
+            const float value = probabilities[i];
+            if (value > first) {
+                second = first;
+                first = value;
+            } else if (value > second) {
+                second = value;
             }
-            std::cout << "  Min: " << min_val << ", Max: " << max_val << ", Mean: " << sum / intermediate_tensors_[i].size() << "\n";
-            std::cout << "  First 10 values: [";
-            for (size_t j = 0; j < std::min(size_t(10), static_cast<size_t>(intermediate_tensors_[i].size())); ++j) {
-                std::cout << ptr[j];
-                if (j < 9) std::cout << ", ";
-            }
-            std::cout << "]\n";
         }
-
-        if (debug_enabled && i == 10) {
-            // Print stats after last Linear layer (before softmax)
-            std::cout << "\n=== Layer " << i << " (Linear 128->10) output stats ===\n";
-            const float* ptr = intermediate_tensors_[i].raw_ptr();
-            float min_val = ptr[0], max_val = ptr[0];
-            float sum = 0;
-            for (size_t j = 0; j < intermediate_tensors_[i].size(); ++j) {
-                if (ptr[j] < min_val) min_val = ptr[j];
-                if (ptr[j] > max_val) max_val = ptr[j];
-                sum += ptr[j];
-            }
-            std::cout << "  Min: " << min_val << ", Max: " << max_val << ", Mean: " << sum / intermediate_tensors_[i].size() << "\n";
-            std::cout << "  Raw logits: [";
-            for (size_t j = 0; j < intermediate_tensors_[i].size(); ++j) {
-                std::cout << ptr[j];
-                if (j < intermediate_tensors_[i].size() - 1) std::cout << ", ";
-            }
-            std::cout << "]\n";
-            // Calculate expected softmax manually
-            std::cout << "  Expected softmax: [";
-            float exp_sum = 0;
-            std::vector<float> exp_vals(10);
-            for (size_t j = 0; j < 10; ++j) {
-                exp_vals[j] = std::exp(ptr[j]);
-                exp_sum += exp_vals[j];
-            }
-            for (size_t j = 0; j < 10; ++j) {
-                std::cout << (exp_vals[j] / exp_sum);
-                if (j < 9) std::cout << ", ";
-            }
-            std::cout << "]\n";
+        if (first - second < 0.02f) {
+            set_dynamic_quantization(false);
+            execute_layers();
+            set_dynamic_quantization(true);
         }
     }
 
@@ -724,6 +852,55 @@ size_t Model::compute_workspace_size() {
 }
 
 void Model::fuse_layers() {
+    if (layers_.size() < 2) return;
+
+    std::vector<std::unique_ptr<Layer>> fused;
+    fused.reserve(layers_.size());
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        const bool followed_by_relu_and_pool = i + 2 < layers_.size() &&
+            layers_[i + 1]->type() == LayerType::kReLU &&
+            layers_[i + 2]->type() == LayerType::kMaxPool2D;
+        if (followed_by_relu_and_pool) {
+            if (auto* conv = dynamic_cast<Conv2DLayer*>(layers_[i].get())) {
+                conv->fuse_relu_ = true;
+                conv->fuse_maxpool_ = true;
+                fused.push_back(std::move(layers_[i]));
+                i += 2;
+                continue;
+            }
+        }
+        const bool followed_by_relu = i + 1 < layers_.size() &&
+                                      layers_[i + 1]->type() == LayerType::kReLU;
+        if (followed_by_relu) {
+            if (auto* conv = dynamic_cast<Conv2DLayer*>(layers_[i].get())) {
+                conv->fuse_relu_ = true;
+                fused.push_back(std::move(layers_[i]));
+                ++i;
+                continue;
+            }
+            if (auto* linear_layer = dynamic_cast<LinearLayer*>(layers_[i].get())) {
+                linear_layer->fuse_relu_ = true;
+                fused.push_back(std::move(layers_[i]));
+                ++i;
+                continue;
+            }
+        }
+        fused.push_back(std::move(layers_[i]));
+    }
+
+    layers_ = std::move(fused);
+    layer_map_.clear();
+    for (const auto& layer : layers_) {
+        layer_map_[layer->name()] = layer.get();
+    }
+}
+
+void Model::set_dynamic_quantization(bool enabled) {
+    for (const auto& layer : layers_) {
+        if (auto* linear_layer = dynamic_cast<LinearLayer*>(layer.get())) {
+            linear_layer->dynamic_quantization_enabled_ = enabled;
+        }
+    }
 }
 
 //==========================================================================
@@ -858,6 +1035,10 @@ InferenceEngine::InferenceEngine(const Config& config)
     : config_(config)
 {
     std::memset(&stats_, 0, sizeof(stats_));
+    omp_set_dynamic(0);
+    if (config_.num_threads > 0) {
+        omp_set_num_threads(config_.num_threads);
+    }
 }
 
 bool InferenceEngine::load_model(const std::string& path) {
@@ -865,21 +1046,25 @@ bool InferenceEngine::load_model(const std::string& path) {
 }
 
 Tensor InferenceEngine::infer(const Tensor& input) {
-    auto start = std::chrono::high_resolution_clock::now();
     Tensor output = Tensor::zeros(model_.output_shape());
+    infer_into(input, output);
+    return output;
+}
+
+void InferenceEngine::infer_into(const Tensor& input, Tensor& output) {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    auto start = std::chrono::high_resolution_clock::now();
     model_.forward(input, output);
     auto end = std::chrono::high_resolution_clock::now();
     double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
     inference_times_.push_back(time_ms);
     stats_.num_inferences++;
-    return output;
 }
 
 std::vector<Tensor> InferenceEngine::infer_batch(
     const std::vector<Tensor>& inputs)
 {
     std::vector<Tensor> outputs(inputs.size());
-    #pragma omp parallel for
     for (size_t i = 0; i < inputs.size(); ++i) {
         outputs[i] = infer(inputs[i]);
     }
@@ -887,6 +1072,7 @@ std::vector<Tensor> InferenceEngine::infer_batch(
 }
 
 auto InferenceEngine::get_stats() const -> Stats {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
     Stats stats = stats_;
     if (!inference_times_.empty()) {
         stats.total_time_ms = 0;
@@ -904,11 +1090,13 @@ auto InferenceEngine::get_stats() const -> Stats {
 }
 
 void InferenceEngine::reset_stats() {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
     std::memset(&stats_, 0, sizeof(stats_));
     inference_times_.clear();
 }
 
 std::vector<Tensor> InferenceEngine::get_intermediate_outputs() const {
+    std::lock_guard<std::mutex> lock(inference_mutex_);
     return model_.intermediate_tensors_;
 }
 

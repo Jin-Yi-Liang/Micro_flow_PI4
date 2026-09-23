@@ -275,80 +275,89 @@ void conv2d_direct_3x3_neon(const Tensor& input,
     // 清零输出
     std::memset(out_ptr, 0, F * H_out * W_out * sizeof(float));
 
-    // 并行化输出通道和高度
-    #pragma omp parallel for
+    // Fast path for the common 3x3/s1/p1 case. Interior pixels need no
+    // bounds checks and eight neighbouring outputs are accumulated at once.
+    if (stride != 1 || pad != 1 || H_out != H || W_out != W || H < 3 || W < 3) {
+        conv2d_direct(input, kernel, output, params);
+        return;
+    }
+
+    auto scalar_at = [=](int f, int h_out, int w_out) {
+        float sum = 0.0f;
+        for (int c = 0; c < C_in; ++c) {
+            const float* kernel_c = k_ptr + (static_cast<size_t>(f) * C_in + c) * 9;
+            for (int kh = 0; kh < 3; ++kh) {
+                const int h = h_out - 1 + kh;
+                if (h < 0 || h >= H) continue;
+                for (int kw = 0; kw < 3; ++kw) {
+                    const int w = w_out - 1 + kw;
+                    if (w >= 0 && w < W) {
+                        sum += in_ptr[(static_cast<size_t>(c) * H + h) * W + w] *
+                               kernel_c[kh * 3 + kw];
+                    }
+                }
+            }
+        }
+        return sum;
+    };
+
+    #pragma omp parallel for schedule(static)
     for (int f = 0; f < F; ++f) {
         for (int h_out = 0; h_out < H_out; ++h_out) {
-            int w_out = 0;
-
-            // W方向向量化处理 (一次处理4个输出位置)
-            for (; w_out <= W_out - 4; w_out += 4) {
-                // 4个位置的累加器
-                float32x4_t sum0 = vdupq_n_f32(0.0f);
-                float32x4_t sum1 = vdupq_n_f32(0.0f);
-                float32x4_t sum2 = vdupq_n_f32(0.0f);
-                float32x4_t sum3 = vdupq_n_f32(0.0f);
-
-                // 对输入通道循环
-                for (int c = 0; c < C_in; ++c) {
-                    // 3x3卷积核加载 (9个元素)
-                    // k[f, c, :, :]
-                    const float* k_ptr_fc = k_ptr + f * C_in * 9 + c * 9;
-
-                    // 对卷积核的每个位置
-                    for (int kh = 0; kh < 3; ++kh) {
-                        for (int kw = 0; kw < 3; ++kw) {
-                            int h_in = h_out * stride - pad + kh;
-
-                            // 加载4个位置的输入值 (w_out+0, w_out+1, w_out+2, w_out+3)
-                            float32x4_t in_vals;
-                            float in_temp[4];
-
-                            for (int i = 0; i < 4; ++i) {
-                                int w_in = (w_out + i) * stride - pad + kw;
-                                if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
-                                    in_temp[i] = in_ptr[c * H * W + h_in * W + w_in];
-                                } else {
-                                    in_temp[i] = 0.0f;
-                                }
-                            }
-                            in_vals = vld1q_f32(in_temp);
-
-                            // 卷积核权重 (广播)
-                            float k_val = k_ptr_fc[kh * 3 + kw];
-                            float32x4_t k_vec = vdupq_n_f32(k_val);
-
-                            // 乘加
-                            sum0 = vmlaq_f32(sum0, in_vals, k_vec);
-                        }
-                    }
+            if (h_out == 0 || h_out == H_out - 1) {
+                for (int w_out = 0; w_out < W_out; ++w_out) {
+                    out_ptr[(static_cast<size_t>(f) * H_out + h_out) * W_out + w_out] =
+                        scalar_at(f, h_out, w_out);
                 }
-
-                // 存储结果
-                int out_offset = f * H_out * W_out + h_out * W_out + w_out;
-                vst1q_f32(&out_ptr[out_offset], sum0);
+                continue;
             }
 
-            // 处理剩余的输出位置
-            for (; w_out < W_out; ++w_out) {
-                int h_in = h_out * stride - pad;
-                int w_in = w_out * stride - pad;
+            out_ptr[(static_cast<size_t>(f) * H_out + h_out) * W_out] =
+                scalar_at(f, h_out, 0);
 
-                float sum = 0.0f;
+            int w_out = 1;
+            for (; w_out + 7 <= W_out - 2; w_out += 8) {
+                float32x4_t acc0 = vdupq_n_f32(0.0f);
+                float32x4_t acc1 = vdupq_n_f32(0.0f);
                 for (int c = 0; c < C_in; ++c) {
+                    const float* kernel_c = k_ptr + (static_cast<size_t>(f) * C_in + c) * 9;
                     for (int kh = 0; kh < 3; ++kh) {
-                        for (int kw = 0; kw < 3; ++kw) {
-                            int h = h_in + kh;
-                            int w = w_in + kw;
-
-                            if (h >= 0 && h < H && w >= 0 && w < W) {
-                                sum += in_ptr[c * H * W + h * W + w] *
-                                      k_ptr[f * C_in * 9 + c * 9 + kh * 3 + kw];
-                            }
-                        }
+                        const float* row = in_ptr +
+                            (static_cast<size_t>(c) * H + (h_out - 1 + kh)) * W + w_out - 1;
+                        acc0 = vmlaq_n_f32(acc0, vld1q_f32(row), kernel_c[kh * 3]);
+                        acc0 = vmlaq_n_f32(acc0, vld1q_f32(row + 1), kernel_c[kh * 3 + 1]);
+                        acc0 = vmlaq_n_f32(acc0, vld1q_f32(row + 2), kernel_c[kh * 3 + 2]);
+                        acc1 = vmlaq_n_f32(acc1, vld1q_f32(row + 4), kernel_c[kh * 3]);
+                        acc1 = vmlaq_n_f32(acc1, vld1q_f32(row + 5), kernel_c[kh * 3 + 1]);
+                        acc1 = vmlaq_n_f32(acc1, vld1q_f32(row + 6), kernel_c[kh * 3 + 2]);
                     }
                 }
-                out_ptr[f * H_out * W_out + h_out * W_out + w_out] = sum;
+                float* dst = out_ptr +
+                    (static_cast<size_t>(f) * H_out + h_out) * W_out + w_out;
+                vst1q_f32(dst, acc0);
+                vst1q_f32(dst + 4, acc1);
+            }
+
+            for (; w_out + 3 <= W_out - 2; w_out += 4) {
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (int c = 0; c < C_in; ++c) {
+                    const float* kernel_c = k_ptr + (static_cast<size_t>(f) * C_in + c) * 9;
+                    for (int kh = 0; kh < 3; ++kh) {
+                        const float* row = in_ptr +
+                            (static_cast<size_t>(c) * H + (h_out - 1 + kh)) * W + w_out - 1;
+                        acc = vmlaq_n_f32(acc, vld1q_f32(row), kernel_c[kh * 3]);
+                        acc = vmlaq_n_f32(acc, vld1q_f32(row + 1), kernel_c[kh * 3 + 1]);
+                        acc = vmlaq_n_f32(acc, vld1q_f32(row + 2), kernel_c[kh * 3 + 2]);
+                    }
+                }
+                vst1q_f32(out_ptr +
+                          (static_cast<size_t>(f) * H_out + h_out) * W_out + w_out,
+                          acc);
+            }
+
+            for (; w_out < W_out; ++w_out) {
+                out_ptr[(static_cast<size_t>(f) * H_out + h_out) * W_out + w_out] =
+                    scalar_at(f, h_out, w_out);
             }
         }
     }
@@ -373,21 +382,6 @@ void conv2d_winograd(const Tensor& input,
         return;
     }
 
-    const auto& in_shapes = input.shapes();
-    const auto& k_shapes = kernel.shapes();
-
-    int C_in = in_shapes[0];
-    int H = in_shapes[1];
-    int W = in_shapes[2];
-    int F = k_shapes[0];
-
-    int H_out = (H + 2 * params.padding - 3) + 1;
-    int W_out = (W + 2 * params.padding - 3) + 1;
-
-    const float* in_ptr = input.raw_ptr();
-    const float* k_ptr = kernel.raw_ptr();
-    float* out_ptr = output.raw_ptr();
-
     // Winograd变换矩阵
     // B = [[1, 0, -1],
     //      [0, 1, 1],
@@ -399,12 +393,179 @@ void conv2d_winograd(const Tensor& input,
 
     // 这里使用简化版本, 实际应该使用完整的Winograd算法
 
-    // 回退到NEON优化版本 (树莓派4上性能已经很好)
+    // 回退到 NEON 优化版本。
     #ifdef MICROFLOW_HAS_NEON
         conv2d_direct_3x3_neon(input, kernel, output, params);
     #else
         conv2d_direct(input, kernel, output, params);
     #endif
+}
+
+void winograd_transform_kernel_3x3(const Tensor& kernel, Tensor& transformed) {
+    const int filters = static_cast<int>(kernel.shapes()[0]);
+    const int channels = static_cast<int>(kernel.shapes()[1]);
+    const float* source = kernel.raw_ptr();
+    float* destination = transformed.raw_ptr();
+
+    #pragma omp parallel for schedule(static)
+    for (int filter = 0; filter < filters; ++filter) {
+        for (int channel = 0; channel < channels; ++channel) {
+            const float* g = source +
+                (static_cast<size_t>(filter) * channels + channel) * 9;
+            float temporary[4][3];
+            for (int column = 0; column < 3; ++column) {
+                temporary[0][column] = g[column];
+                temporary[1][column] = 0.5f * (g[column] + g[3 + column] + g[6 + column]);
+                temporary[2][column] = 0.5f * (g[column] - g[3 + column] + g[6 + column]);
+                temporary[3][column] = g[6 + column];
+            }
+            float* u = destination +
+                (static_cast<size_t>(filter) * channels + channel) * 16;
+            for (int row = 0; row < 4; ++row) {
+                u[row * 4] = temporary[row][0];
+                u[row * 4 + 1] = 0.5f * (temporary[row][0] + temporary[row][1] +
+                                         temporary[row][2]);
+                u[row * 4 + 2] = 0.5f * (temporary[row][0] - temporary[row][1] +
+                                         temporary[row][2]);
+                u[row * 4 + 3] = temporary[row][2];
+            }
+        }
+    }
+}
+
+void conv2d_winograd_f2x2(const Tensor& input,
+                          const Tensor& transformed_kernel,
+                          const Tensor& bias,
+                          Tensor& output,
+                          bool apply_relu,
+                          float* workspace,
+                          bool apply_maxpool) {
+    const int channels = static_cast<int>(input.shapes()[0]);
+    const int height = static_cast<int>(input.shapes()[1]);
+    const int width = static_cast<int>(input.shapes()[2]);
+    const int filters = static_cast<int>(transformed_kernel.shapes()[0]);
+    const int output_height = static_cast<int>(output.shapes()[1]);
+    const int output_width = static_cast<int>(output.shapes()[2]);
+    const int convolution_height = apply_maxpool ? output_height * 2 : output_height;
+    const int convolution_width = apply_maxpool ? output_width * 2 : output_width;
+    const int tile_rows = (convolution_height + 1) / 2;
+    const int tile_columns = (convolution_width + 1) / 2;
+    const int tile_count = tile_rows * tile_columns;
+    const float* input_ptr = input.raw_ptr();
+    const float* kernel_ptr = transformed_kernel.raw_ptr();
+    const float* bias_ptr = bias.is_valid() ? bias.raw_ptr() : nullptr;
+    float* output_ptr = output.raw_ptr();
+
+    // V = B^T d B. Layout is [tile, channel, 16], allowing all filters
+    // to reuse the input transform.
+    #pragma omp parallel
+    {
+    #pragma omp for collapse(2) schedule(static)
+    for (int tile = 0; tile < tile_count; ++tile) {
+        for (int channel = 0; channel < channels; ++channel) {
+            const int tile_row = tile / tile_columns;
+            const int tile_column = tile % tile_columns;
+            const int input_row = tile_row * 2 - 1;
+            const int input_column = tile_column * 2 - 1;
+            float d[4][4]{};
+            for (int row = 0; row < 4; ++row) {
+                const int source_row = input_row + row;
+                if (source_row < 0 || source_row >= height) continue;
+                for (int column = 0; column < 4; ++column) {
+                    const int source_column = input_column + column;
+                    if (source_column >= 0 && source_column < width) {
+                        d[row][column] = input_ptr[
+                            (static_cast<size_t>(channel) * height + source_row) * width +
+                            source_column];
+                    }
+                }
+            }
+
+            float temporary[4][4];
+            float* v = workspace +
+                (static_cast<size_t>(tile) * channels + channel) * 16;
+            for (int column = 0; column < 4; ++column) {
+                temporary[0][column] = d[0][column] - d[2][column];
+                temporary[1][column] = d[1][column] + d[2][column];
+                temporary[2][column] = -d[1][column] + d[2][column];
+                temporary[3][column] = d[1][column] - d[3][column];
+            }
+            for (int row = 0; row < 4; ++row) {
+                v[row * 4] = temporary[row][0] - temporary[row][2];
+                v[row * 4 + 1] = temporary[row][1] + temporary[row][2];
+                v[row * 4 + 2] = -temporary[row][1] + temporary[row][2];
+                v[row * 4 + 3] = temporary[row][1] - temporary[row][3];
+            }
+        }
+    }
+
+    #pragma omp for schedule(static)
+    for (int filter = 0; filter < filters; ++filter) {
+        for (int tile = 0; tile < tile_count; ++tile) {
+            float m[16]{};
+#ifdef MICROFLOW_HAS_NEON
+            float32x4_t m0 = vdupq_n_f32(0.0f);
+            float32x4_t m1 = vdupq_n_f32(0.0f);
+            float32x4_t m2 = vdupq_n_f32(0.0f);
+            float32x4_t m3 = vdupq_n_f32(0.0f);
+            for (int channel = 0; channel < channels; ++channel) {
+                const float* u = kernel_ptr +
+                    (static_cast<size_t>(filter) * channels + channel) * 16;
+                const float* v = workspace +
+                    (static_cast<size_t>(tile) * channels + channel) * 16;
+                m0 = vfmaq_f32(m0, vld1q_f32(u), vld1q_f32(v));
+                m1 = vfmaq_f32(m1, vld1q_f32(u + 4), vld1q_f32(v + 4));
+                m2 = vfmaq_f32(m2, vld1q_f32(u + 8), vld1q_f32(v + 8));
+                m3 = vfmaq_f32(m3, vld1q_f32(u + 12), vld1q_f32(v + 12));
+            }
+            vst1q_f32(m, m0);
+            vst1q_f32(m + 4, m1);
+            vst1q_f32(m + 8, m2);
+            vst1q_f32(m + 12, m3);
+#else
+            for (int channel = 0; channel < channels; ++channel) {
+                const float* u = kernel_ptr +
+                    (static_cast<size_t>(filter) * channels + channel) * 16;
+                const float* v = workspace +
+                    (static_cast<size_t>(tile) * channels + channel) * 16;
+                for (int i = 0; i < 16; ++i) m[i] += u[i] * v[i];
+            }
+#endif
+            float temporary[2][4];
+            for (int column = 0; column < 4; ++column) {
+                temporary[0][column] = m[column] + m[4 + column] + m[8 + column];
+                temporary[1][column] = m[4 + column] - m[8 + column] - m[12 + column];
+            }
+            float result[4] = {
+                temporary[0][0] + temporary[0][1] + temporary[0][2],
+                temporary[0][1] - temporary[0][2] - temporary[0][3],
+                temporary[1][0] + temporary[1][1] + temporary[1][2],
+                temporary[1][1] - temporary[1][2] - temporary[1][3],
+            };
+            const float bias_value = bias_ptr ? bias_ptr[filter] : 0.0f;
+            const int output_row = (tile / tile_columns) * 2;
+            const int output_column = (tile % tile_columns) * 2;
+            if (apply_maxpool) {
+                float value = std::max(std::max(result[0], result[1]),
+                                       std::max(result[2], result[3])) + bias_value;
+                if (apply_relu) value = std::max(value, 0.0f);
+                output_ptr[(static_cast<size_t>(filter) * output_height +
+                            tile / tile_columns) * output_width + tile % tile_columns] = value;
+                continue;
+            }
+            for (int row = 0; row < 2; ++row) {
+                if (output_row + row >= convolution_height) continue;
+                for (int column = 0; column < 2; ++column) {
+                    if (output_column + column >= convolution_width) continue;
+                    float value = result[row * 2 + column] + bias_value;
+                    if (apply_relu) value = std::max(value, 0.0f);
+                    output_ptr[(static_cast<size_t>(filter) * output_height +
+                                output_row + row) * output_width + output_column + column] = value;
+                }
+            }
+        }
+    }
+    }
 }
 
 //==========================================================================
@@ -714,7 +875,8 @@ void conv2d(const Tensor& input,
             int W_out = (W + 2 * params.padding - K) / params.stride + 1;
 
             // im2col变换
-            Tensor col({C_in * K * K, H_out * W_out});
+            Tensor col({static_cast<uint32_t>(C_in * K * K),
+                        static_cast<uint32_t>(H_out * W_out)});
             #ifdef MICROFLOW_HAS_NEON
                 im2col_neon(input, col, params);
             #else
@@ -726,9 +888,11 @@ void conv2d(const Tensor& input,
             // col: [C_in*K*K, H_out*W_out]
             // output: [F, H_out*W_out]
 
-            Tensor kernel_mat({F, C_in * K * K},
+            Tensor kernel_mat({static_cast<uint32_t>(F),
+                               static_cast<uint32_t>(C_in * K * K)},
                             const_cast<float*>(kernel.raw_ptr()));
-            Tensor output_mat({F, H_out * W_out},
+            Tensor output_mat({static_cast<uint32_t>(F),
+                               static_cast<uint32_t>(H_out * W_out)},
                             output.raw_ptr());
 
             gemm(kernel_mat, col, output_mat);
@@ -813,8 +977,9 @@ void conv2d_bn_relu(const Tensor& input,
     int K = k_shapes[2];
 
     // 创建融合后的权重
-    Tensor kernel_fused({F, C_in, K, K});
-    Tensor bias_fused({F});
+    Tensor kernel_fused({static_cast<uint32_t>(F), static_cast<uint32_t>(C_in),
+                         static_cast<uint32_t>(K), static_cast<uint32_t>(K)});
+    Tensor bias_fused({static_cast<uint32_t>(F)});
 
     const float* k_ptr = kernel.raw_ptr();
     const float* mean_ptr = bn_mean.raw_ptr();
@@ -845,8 +1010,14 @@ void conv2d_bn_relu(const Tensor& input,
     // 使用融合后的参数执行卷积
     conv2d(input, kernel_fused, bias_fused, output, params, workspace);
 
-    // ReLU
-    conv2d_relu(input, kernel, output, params, workspace);
+    // In-place ReLU. Calling conv2d_relu here would run the original
+    // convolution a second time and overwrite the fused BatchNorm result.
+    float* output_ptr = output.raw_ptr();
+    const int output_size = static_cast<int>(output.size());
+    #pragma omp parallel for if(output_size >= 4096)
+    for (int i = 0; i < output_size; ++i) {
+        output_ptr[i] = std::max(output_ptr[i], 0.0f);
+    }
 }
 
 //==========================================================================

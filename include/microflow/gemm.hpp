@@ -4,6 +4,7 @@
 #include "microflow/tensor.hpp"
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace microflow {
 
@@ -86,6 +87,28 @@ void gemm(const Tensor& A, const Tensor& B, Tensor& C,
           const GEMMConfig& config = GEMMConfig());
 
 /**
+ * @brief Batch-one fully connected kernel using output-major packed weights.
+ *
+ * @param input Input vector [in_features]
+ * @param packed_weights Weights [out_features, in_features]
+ * @param bias Optional bias [out_features]
+ * @param output Output vector [out_features]
+ * @param apply_relu Fuse ReLU into the output store
+ */
+void gemv_packed(const Tensor& input, const Tensor& packed_weights,
+                 const Tensor& bias, Tensor& output, bool apply_relu = false);
+
+/** Dynamic-int8 batch-one fully connected kernel with per-output weight scales. */
+void gemv_int8_dynamic(const Tensor& input,
+                       const std::vector<int8_t>& packed_weights,
+                       const std::vector<float>& weight_scales,
+                       const std::vector<int32_t>& weight_sums,
+                       const Tensor& bias,
+                       Tensor& output,
+                       bool apply_relu,
+                       std::vector<int8_t>& input_buffer);
+
+/**
  * @brief 批量矩阵乘法
  *
  * @param batch 批大小
@@ -142,7 +165,7 @@ void gemm_naive(const Tensor& A, const Tensor& B, Tensor& C);
 void gemm_omp(const Tensor& A, const Tensor& B, Tensor& C);
 
 /**
- * @brief ARM NEON优化版本 (推荐用于树莓派4)
+ * @brief ARM NEON优化版本 (推荐用于 ROCK 4D Cortex-A72 大核)
  *
  * @优化技术:
  * 1. **缓存分块**: 适配Cortex-A72的L1/L2缓存
@@ -151,7 +174,7 @@ void gemm_omp(const Tensor& A, const Tensor& B, Tensor& C);
  * 4. **软件预取**: __builtin_prefetch减少stall
  * 5. **循环展开**: 4x展开隐藏延迟
  *
- * @性能预期: 在树莓派4上可达30-40 GFLOPS
+ * 实际性能取决于矩阵形状、线程数和 CPU 调频，应使用 benchmark 实测。
  */
 void gemm_neon(const Tensor& A, const Tensor& B, Tensor& C,
                const GEMMConfig& config = GEMMConfig());
@@ -248,7 +271,7 @@ GEMMImpl select_best_implementation(int M, int N, int K);
  * @brief 获取最优配置
  *
  * @detail:
- * 根据树莓派4的硬件特性自动调优参数
+ * 根据 ARM64 Cortex-A72 的缓存和寄存器特性选择参数
  */
 GEMMConfig get_optimal_config(int M, int N, int K);
 

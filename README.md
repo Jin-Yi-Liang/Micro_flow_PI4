@@ -1,347 +1,246 @@
-# MicroFlow v3.3
+# MicroFlow
 
-## 轻量级神经网络推理引擎 - 树莓派4极致优化版
+MicroFlow 是一个面向 ARM64 边缘设备的轻量级 C++ 神经网络推理引擎。本分支针对 Radxa ROCK 4D（RK3576，4×Cortex-A72 + 4×Cortex-A53）进行了端到端优化，当前提供模型加载、MNIST 文件/图片识别、完整测试集评估、性能统计和浏览器手写识别服务。
 
-MicroFlow是一个专门针对树莓派4（Cortex-A72 ARM64架构）深度优化的轻量级神经网络推理引擎。它实现了高效的神经网络算子，支持CNN模型推理，适用于边缘计算场景。
+项目不依赖 Python 才能执行推理；运行时由 C++17、OpenMP 和项目内置的图像/HTTP 组件组成。Python 只用于训练导出、下载测试集以及生成竞品基准模型。
 
----
+## 当前实测结果
 
-## 特性
+测试日期：2026-09-23。设备为 ROCK 4D，Debian 12，Linux 6.1.84，固定运行在 Cortex-A72 大核 CPU 4–7，Release 构建，4 个 OpenMP 线程。数据为官方 MNIST test set 的全部 10,000 张图片。
 
-### 性能优化
-- ✅ **ARM NEON SIMD加速**: 所有核心算子针对NEON指令集优化
-- ✅ **零拷贝张量操作**: 高效的内存管理，避免不必要的数据复制
-- ✅ **层融合优化**: Conv+BN+ReLU等层自动融合
-- ✅ **缓存友好算法**: 针对Cortex-A72的L1/L2缓存特性优化
-- ✅ **多线程并行**: OpenMP并行化充分利用四核CPU
+| 实现 | 模型/精度策略 | 正确数 | 准确率 | 平均延迟 | 整体吞吐量 |
+|---|---|---:|---:|---:|---:|
+| MicroFlow 优化前基线 | FP32 | 9,937/10,000 | 99.37% | 约 4.52 ms | 约 221 images/s |
+| MicroFlow 当前版本 | Winograd + 混合 INT8/FP32 | 9,937/10,000 | 99.37% | **0.505 ms** | **1,959.4 images/s** |
+| ncnn 20260526 | FP32，禁用 FP16/BF16 | 9,937/10,000 | 99.37% | 0.591 ms | 1,671.3 images/s |
 
-### 轻量级设计
-- 📦 **零依赖**: 仅依赖OpenMP（系统自带）
-- 💾 **小内存占用**: 典型模型推理仅需16-32MB内存
-- 🚀 **快速启动**: 无需外部框架，秒级启动
+表中性能取连续三轮完整测试的中位一轮；MicroFlow 三轮平均延迟为 0.505/0.514/0.500 ms，P99 为 0.545～0.556 ms，冷机最佳轮为 0.489 ms。当前版本相对原始 ROCK 4D 基线约加速 **9.0 倍**，没有损失测试集准确率。在相同权重、相同输入、相同四个大核和相同预测结果下，相比 ncnn 参考实现平均延迟低约 **14.6%**，整体吞吐量高约 **17.2%**。最终数据应以目标板执行 `scripts/microflow-rock4d eval 10000` 的输出为准；温度、CPU 调频与后台负载会影响延迟。
 
-### 易用性
-- 🎯 **简单API**: 类似PyTorch的直观接口
-- 📊 **模型格式**: 自定义.mflow格式，支持从PyTorch导出
-- 🔧 **完整工具链**: 模型转换、性能分析、调试工具
-- 🌐 **Web界面**: 简洁的浏览器手写识别界面
-- 🖼️ **图像支持**: PNG/JPEG/BMP等格式直接推理
+竞品基准使用官方 ncnn tag `20260526`（commit `e54f7b1f88434e1d844ea0551b880a1cfb079ce1`），参考程序位于 `benchmarks/ncnn/`。它从同一个 `.mflow` 文件导出权重，不重新训练模型。
 
----
+## 系统能力
 
-## 性能数据
+- `.mflow` V2/V3 二进制模型加载与格式校验：检查 magic、版本、层类型、张量维度、数据类型、形状和文件截断。
+- NCHW 张量、64 字节对齐内存、外部内存 View 和零拷贝 Flatten/Reshape。
+- Conv2D、DepthwiseConv2D、PointwiseConv2D、BatchNorm、ReLU/ReLU6、池化、Linear、Softmax 等算子。
+- MNIST LeNet 风格模型：`Conv(1→32) → ReLU → Pool → Conv(32→64) → ReLU → Pool → Flatten → Linear(3136→128) → ReLU → Linear(128→10) → Softmax`。
+- `.bin`、PGM、PPM、PNG、JPEG、BMP 等图片输入与 MNIST 自动裁剪/缩放预处理。
+- 命令行单图识别、10,000 张测试集评估、混合量化一致性检查、算子基准和 Web 手写板。
+- HTTP `/health`、`/predict`、`/visualize` 接口，严格校验 784 个有限的 `[0,1]` 像素值，并支持 CORS。
+- 可复用输出张量和串行化的引擎访问，避免长时间服务时持续增长的临时分配及请求数据竞争。
 
-### 树莓派4 (4核 @ 1.5GHz)
+## ROCK 4D 专项优化
 
-| 模型 | 输入尺寸 | 推理时间 | 吞吐量 |
-|-----|---------|---------|--------|
-| LeNet (MNIST) | 1×28×28 | **2.5 ms** | 400 inf/s |
-| 简单CNN | 1×28×28 | **3.8 ms** | 263 inf/s |
-| MobileNetV2 | 1×224×224 | **85 ms** | 12 inf/s |
+推理热路径包含以下优化：
 
-### GEMM性能
-
-| 矩阵大小 | 性能 | 峰值比 |
-|---------|------|-------|
-| 512×512×512 | **40 GFLOPS** | 89% |
-
----
+1. 3×3、stride 1、padding 1 卷积采用 Winograd F(2×2, 3×3)，模型加载时预变换卷积核。
+2. Winograd 输出阶段融合 bias、ReLU 和 2×2 MaxPool，减少中间张量写回和独立算子调度。
+3. ARM NEON 向量化卷积、GEMV 和 INT8 点积；非适配形状仍保留通用正确性路径。
+4. 大型第一全连接层使用分块动态 INT8；置信边界样本自动回退 FP32，以保持 99.37% 的完整测试集精度。
+5. 小型第二全连接层保留 FP32，避免量化开销超过计算收益。
+6. Flatten 使用 View，Linear 权重在加载阶段预打包，推理阶段复用工作区和输出内存。
+7. 单次 OpenMP 并行区覆盖完整卷积，避免细粒度并行调度成本。
+8. ROCK 4D 是异构八核；默认只绑定 CPU 4–7 的四个 Cortex-A72 大核，防止线程漂移到 Cortex-A53 小核后性能下降。
 
 ## 快速开始
 
-### 编译
+### 依赖
+
+Debian/Ubuntu：
 
 ```bash
-# 克隆项目
-git clone https://github.com/your-repo/MicroFlow.git
-cd MicroFlow/pi4_optimized
-
-# 创建构建目录
-mkdir build && cd build
-
-# 配置和编译
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j4
+sudo apt-get install build-essential cmake ninja-build python3
 ```
 
-### 运行示例
+### 一键构建与测试
 
 ```bash
-# MNIST手写数字识别（命令行）
-./mnist_demo ../models/mnist.mflow ../models/sample3.bin
+git clone https://github.com/Jin-Yi-Liang/Micro_flow_PI4.git
+cd Micro_flow_PI4
 
-# 图像文件识别（支持PNG/JPEG等）
-./image_demo ../models/mnist_mixed.mflow /path/to/image.png
-
-# Web手写识别服务（浏览器界面）
-./web_demo ../models/mnist_mixed.mflow 8080
-# 浏览器访问: http://localhost:8080
-# 或使用树莓派IP: http://192.168.1.9:8080
-
-# 运行性能基准测试
-./benchmark
+./scripts/microflow-rock4d build
+./scripts/microflow-rock4d test
 ```
 
-### 运行测试
+脚本默认生成 `build-rock4d/`。也可以手动构建：
 
 ```bash
-# 单元测试
-./test_tensor
-./test_gemm
-./test_conv
-
-# 全部测试
-make test
+cmake -S . -B build-rock4d -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rock4d -j"$(nproc)"
+ctest --test-dir build-rock4d --output-on-failure
 ```
 
----
+### 单张识别
 
-## 代码示例
+仓库内置的测试输入标签为 7：
 
-### C++ API
+```bash
+./scripts/microflow-rock4d demo image/test_input.bin 1000
+```
 
-```cpp
-#include "microflow/runtime.hpp"
-#include "microflow/tensor.hpp"
+也可识别常见图片；拍照、扫描或非 28×28 图片建议启用预处理：
 
-using namespace microflow;
+```bash
+taskset -c 4-7 build-rock4d/image_inference \
+  models/mnist_improved.mflow image/image_7.png 4 --preprocess
+```
 
-int main() {
-    // 1. 加载模型
-    Model model;
-    model.load("model.mflow");
+### 完整 MNIST 测试
 
-    // 2. 准备输入
-    Tensor input({1, 28, 28});
-    // ... 填充输入数据 ...
+```bash
+./scripts/microflow-rock4d eval 10000
+```
 
-    // 3. 执行推理
-    Tensor output = Tensor::zeros({1, 10});
-    model.forward(input, output);
+若测试集不存在，脚本会下载并校验 MNIST IDX 文件。评估程序输出正确数、准确率、平均延迟、P50/P90/P99、端到端吞吐量和 10×10 混淆矩阵。
 
-    // 4. 获取结果
-    const float* predictions = output.raw_ptr();
+### Web 手写识别系统
 
-    return 0;
+```bash
+./scripts/microflow-rock4d serve 8080
+```
+
+在同一网络的浏览器打开 `http://<ROCK-4D-IP>:8080`，即可在画布上书写数字并查看预测概率和中间层特征图。
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8080/health
+```
+
+预测接口接收 JSON：
+
+```json
+{
+  "pixels": [0.0, 0.0, 0.5, 1.0]
 }
 ```
 
-### 模型构建器
+`pixels` 必须恰好包含 784 个数。成功响应示例：
 
-```cpp
-// 流式API构建模型
-Model model = ModelBuilder("MyCNN")
-    .input({1, 28, 28})
-    .conv2d("conv1", 32, 3, 1, 1)
-    .batch_norm("bn1")
-    .relu()
-    .max_pool(2, 2)
-    .conv2d("conv2", 64, 3, 1, 1)
-    .batch_norm("bn2")
-    .relu()
-    .max_pool(2, 2)
-    .flatten()
-    .linear("fc1", 128)
-    .relu()
-    .linear("fc2", 10)
-    .softmax()
-    .build();
+```json
+{
+  "digit": 7,
+  "confidence": 0.999998,
+  "scores": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.999998, 0.0, 0.0]
+}
 ```
 
-### 单独使用算子
+## 一键命令
 
-```cpp
-// 卷积
-Tensor input({1, 28, 28});
-Tensor kernel({8, 1, 3, 3});
-Tensor output({8, 28, 28});
-
-Conv2DParams params(3, 1, 1);  // kernel=3, stride=1, padding=1
-conv2d(input, kernel, Tensor(), output, params);
-
-// 激活
-relu(output);
-
-// 池化
-Tensor pooled({8, 14, 14});
-max_pool2d(output, pooled, 2, 2);  // 2x2 pool, stride=2
+```text
+scripts/microflow-rock4d build
+scripts/microflow-rock4d test
+scripts/microflow-rock4d eval [测试图片数量]
+scripts/microflow-rock4d demo [图片路径] [重复次数]
+scripts/microflow-rock4d serve [端口]
 ```
 
----
+可通过环境变量覆盖默认值：
 
-## Python模型导出
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MICROFLOW_BUILD_DIR` | `build-rock4d` | 构建目录 |
+| `MICROFLOW_MODEL` | `models/mnist_improved.mflow` | 模型文件 |
+| `MICROFLOW_DATA_DIR` | `data/MNIST/raw` | IDX 数据目录 |
+| `MICROFLOW_THREADS` | `4` | OpenMP 线程数 |
+| `MICROFLOW_BIG_CORES` | `4-7` | 推理绑定的 CPU 列表 |
 
-### 从PyTorch导出
+## 测试覆盖
 
-```python
-import torch
-import torch.nn as nn
-from microflow_export import export_to_mflow
+`ctest` 当前覆盖：
 
-# 定义模型
-class SimpleNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 8, 3, padding=1)
-        self.relu = nn.ReLU()
-        self.fc = nn.Linear(8 * 14 * 14, 10)
+- Tensor 的所有权、View、复制、通用转置、矩阵乘法、拼接与拆分；
+- `.bin` 与常见图片加载/预处理，以及真实细线手写图片识别；
+- GEMM/GEMV、打包权重、直接卷积和 Winograd 数值一致性；
+- 模型加载、重复推理、批量推理和非法/截断模型拒绝；
+- 内置 MNIST 样本的端到端预测必须为 7。
 
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.relu(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        return x
-
-# 创建并导出模型
-model = SimpleNet()
-model.eval()
-
-export_to_mflow(model, "simple_net.mflow")
-```
-
----
-
-## 项目结构
-
-```
-pi4_optimized/
-├── include/microflow/     # 头文件
-│   ├── allocator.hpp      # 内存分配器
-│   ├── tensor.hpp         # 张量数据结构
-│   ├── gemm.hpp           # 矩阵乘法
-│   ├── conv.hpp           # 卷积
-│   ├── layers.hpp         # 层操作
-│   ├── runtime.hpp        # 运行时系统
-│   ├── image.hpp          # 图像处理
-│   ├── stb_image.h        # 图像加载库
-│   └── httplib.h          # HTTP库
-├── src/                   # 源文件
-│   ├── memory/            # 内存管理
-│   ├── gemm/              # GEMM实现
-│   ├── conv/              # 卷积实现
-│   ├── layers/            # 层实现
-│   └── runtime/           # 运行时实现
-├── tests/                 # 测试程序
-├── examples/              # 示例程序
-│   ├── mnist_demo.cpp      # MNIST命令行识别
-│   ├── image_demo.cpp      # 图像文件识别
-│   └── web_demo.cpp        # Web手写识别服务（简洁界面）
-├── tools/                 # 训练工具
-│   ├── train_mixed.py      # 混合训练脚本
-│   └── csv_to_bin.py       # CSV转BIN工具
-├── docs/                  # 详细文档
-│   ├── memory.md          # 内存管理说明
-│   ├── gemm.md            # GEMM优化说明
-│   ├── conv.md            # 卷积优化说明
-│   ├── layers.md          # 层操作说明
-│   └── runtime.md         # 运行时说明
-└── CMakeLists.txt         # 构建配置
-```
-
----
-
-## 编译选项
-
-### 树莓派4优化
-
-CMakeLists.txt已针对树莓派4配置了以下优化：
-
-```cmake
-# Cortex-A72优化
--march=armv8-a
--mtune=cortex-a72
--mcpu=cortex-a72
-
-# NEON和FMA
--mfpu=neon-fp-armv8
--ffp-contract=fast
-
-# 激进优化
--O3
--ffast-math
--funsafe-math-optimizations
--funroll-loops
--ftree-vectorize
-
-# 链接时优化
--flto
-```
-
-### x86_64开发
-
-在x86_64上编译（开发用）：
+推荐在每次算子优化后执行：
 
 ```bash
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make
+./scripts/microflow-rock4d test
+./scripts/microflow-rock4d eval 10000
 ```
 
----
+单元测试用于发现实现回归；完整 10,000 张评估才是准确率验收标准，两者不能互相替代。
 
-## 支持的层类型
+## 与 ncnn 做可重复对比
 
-| 层类型 | 支持 | 优化状态 |
-|--------|------|---------|
-| Conv2D | ✅ | NEON优化 |
-| DepthwiseConv2D | ✅ | NEON优化 |
-| BatchNorm | ✅ | 支持融合 |
-| ReLU/ReLU6 | ✅ | NEON优化 |
-| GeLU | ✅ | Transformer支持 |
-| MaxPool2D | ✅ | OpenMP并行 |
-| AvgPool2D | ✅ | OpenMP并行 |
-| GlobalAvgPool2D | ✅ | 优化 |
-| Linear | ✅ | GEMM优化 |
-| Flatten | ✅ | 零拷贝 |
-| Softmax | ✅ | 数值稳定 |
-| Reshape | ✅ | 零拷贝 |
-| Concat | ✅ | 基础实现 |
+本仓库只包含参考程序，不捆绑 ncnn 源码。安装 ncnn 后执行：
 
----
+```bash
+python3 tools/export_ncnn_reference.py \
+  models/mnist_improved.mflow benchmarks/ncnn
 
-## 文档
+cmake -S benchmarks/ncnn -B benchmarks/ncnn/build \
+  -Dncnn_DIR=/path/to/ncnn/lib/cmake/ncnn
+cmake --build benchmarks/ncnn/build -j4
 
-详细文档请查看 `docs/` 目录：
+OMP_NUM_THREADS=4 OMP_PROC_BIND=true OMP_PLACES=cores taskset -c 4-7 \
+  benchmarks/ncnn/build/mnist_ncnn_benchmark \
+  benchmarks/ncnn/mnist_improved.param \
+  benchmarks/ncnn/mnist_improved.bin \
+  data/MNIST/raw/t10k-images-idx3-ubyte \
+  data/MNIST/raw/t10k-labels-idx1-ubyte 10000 4
+```
 
-- **memory.md**: 内存管理系统详解
-- **gemm.md**: GEMM优化技术详解
-- **conv.md**: 卷积算法对比与选择
-- **layers.md**: 所有层操作的详细说明
-- **runtime.md**: 运行时系统架构
+公平对比必须固定相同权重、输入、CPU 亲和性、线程数、精度开关和测试数量，并同时核对准确率，不能只比较延迟数字。
 
----
+## C++ 嵌入接口
 
-## 贡献指南
+```cpp
+#include "microflow/runtime.hpp"
 
-欢迎贡献！请遵循以下步骤：
+microflow::InferenceEngine::Config config;
+config.num_threads = 4;
+config.enable_profiling = true;
+microflow::InferenceEngine engine(config);
 
-1. Fork项目
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启Pull Request
+if (!engine.load_model("models/mnist_improved.mflow")) {
+    return 1;
+}
 
----
+microflow::Tensor input({1, 28, 28});
+microflow::Tensor output({10});
+// 将归一化到 [0,1] 的 28×28 灰度像素写入 input。
+engine.infer_into(input, output);
+```
 
-## 许可证
+高频调用应优先使用 `infer_into`，让调用者复用输出张量。`infer` 是便捷接口，会返回新张量。
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](../LICENSE) 文件
+## 目录结构
 
----
+```text
+Micro_flow_PI4/
+├── include/microflow/       公共 C++ 头文件
+├── src/                     张量、算子、图像和运行时实现
+├── models/                  可直接运行的 .mflow 模型
+├── examples/                CLI、图片和 Web 示例
+├── tests/                   单元、运行时、准确率与性能测试
+├── tools/                   训练导出、数据下载和竞品模型转换
+├── benchmarks/ncnn/         同权重 ncnn 参考基准
+├── scripts/microflow-rock4d ROCK 4D 统一操作入口
+└── CMakeLists.txt
+```
 
-## 致谢
+## 常见问题
 
-- ARM NEON技术文档
-- BLAS/LAPACK设计理念
-- PyTorch和TensorFlow的API设计
+### 为什么不用 8 个 CPU 核心？
 
----
+RK3576 的 Cortex-A72 与 Cortex-A53 性能不同。这个小模型的单次推理计算量有限，使用全部八核会增加调度和同步成本。板端实测四个 A72 大核明显更快，因此脚本默认 `taskset -c 4-7`。
 
-## 联系方式
+### 为什么启用 INT8 后仍有 FP32？
 
-- 项目主页: https://github.com/David11850/Micro_flow_PI4
-- 问题反馈: https://github.com/David11850/Micro_flow_PI4/issues
+MicroFlow 使用的是混合路径：第一全连接层的主路径为动态 INT8，而卷积、第二全连接层及置信边界样本保留或回退 FP32。这比“所有层一律量化”更适合当前小模型，并且能够保持完整测试集 99.37% 的结果。
 
----
+### 为什么照片识别可能不如 MNIST 测试集？
 
-**MicroFlow v3.3** - 让边缘AI推理更高效！
+MNIST 是居中、黑底白字的 28×28 灰度分布。真实照片会引入背景、透视、笔画粗细和极性差异。对普通图片使用 `--preprocess`；若面向特定摄像头部署，还应使用该摄像头采集的数据做校准或增广训练。
+
+### 如何确认性能数字不是缓存或短样本偶然值？
+
+运行完整 10,000 张测试并关注 P50/P90/P99；重复至少三次，保持 CPU 亲和性、线程数和散热条件一致。不要用只跑一次单图的 wall time 作为最终结论。
+
+## License
+
+项目许可证见仓库中的 `LICENSE`（若分发前尚未添加许可证文件，请先明确授权条款）。

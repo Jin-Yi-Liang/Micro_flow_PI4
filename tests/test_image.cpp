@@ -4,6 +4,10 @@
 
 using namespace microflow;
 
+#ifndef MICROFLOW_SOURCE_DIR
+#define MICROFLOW_SOURCE_DIR "."
+#endif
+
 int main() {
     std::cout << "╔════════════════════════════════════════════╗\n";
     std::cout << "║     MicroFlow Image Loading Test          ║\n";
@@ -12,7 +16,7 @@ int main() {
     // 测试1: 加载现有MNIST .bin文件
     std::cout << "Test 1: Loading MNIST .bin file...\n";
     Tensor img1;
-    if (Image::load("../image/test_input.bin", img1)) {
+    if (Image::load(MICROFLOW_SOURCE_DIR "/image/test_input.bin", img1)) {
         std::cout << "  ✓ Loaded successfully\n";
         std::cout << "  Shape: [" << img1.shapes()[0] << ", "
                   << img1.shapes()[1] << ", " << img1.shapes()[2] << "]\n";

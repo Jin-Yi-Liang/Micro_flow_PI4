@@ -15,6 +15,7 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
+#include <limits>
 #include <vector>
 
 using namespace microflow;
@@ -121,7 +122,7 @@ void benchmark_memory_allocation() {
         std::cout << "    Total allocated: " << (stats.total_memory / 1024) << " KB\n";
     }
 
-    std::cout << "\n  Speedup: ~" << (std::malloc(alloc_size) ? "50-100x" : "N/A") << "\n";
+    std::cout << "\n  Note: arena reset releases all temporary allocations in one operation.\n";
 }
 
 //==========================================================================
@@ -202,9 +203,7 @@ void benchmark_gemm() {
 
     std::cout << "  └────────┴────────┴────────┴──────────┴──────────┴─────────┘\n";
 
-    // 理论峰值
-    std::cout << "\n  Theoretical Peak (Raspberry Pi 4, 4 cores @ 1.5GHz):\n";
-    std::cout << "    ~45 GFLOPS (with FMA and NEON)\n";
+    std::cout << "\n  Values above are measured on the current host; no theoretical peak is assumed.\n";
 }
 
 //==========================================================================
@@ -319,8 +318,12 @@ void benchmark_inference() {
     std::cout << "  Running " << iterations << " iterations...\n\n";
 
     auto start = get_time_ms();
+    double min_time = std::numeric_limits<double>::max();
+    double max_time = 0.0;
 
     for (int i = 0; i < iterations; ++i) {
+        const double iteration_start = get_time_ms();
+
         // Conv1 + ReLU
         Tensor conv1_out({8, 28, 28});
         conv2d(input, conv1_weight, Tensor(), conv1_out, conv_params);
@@ -335,6 +338,10 @@ void benchmark_inference() {
 
         // FC
         linear(fc_input, fc_weight, fc_bias, fc_output);
+
+        const double iteration_time = get_time_ms() - iteration_start;
+        min_time = std::min(min_time, iteration_time);
+        max_time = std::max(max_time, iteration_time);
     }
 
     auto end = get_time_ms();
@@ -347,8 +354,8 @@ void benchmark_inference() {
     std::cout << "    Total time:   " << std::fixed << std::setprecision(2) << total_time << " ms\n";
     std::cout << "    Average time: " << avg_time << " ms\n";
     std::cout << "    Throughput:   " << std::setprecision(1) << throughput << " inferences/sec\n";
-    std::cout << "    Min time:     " << (avg_time * 0.9) << " ms (estimated)\n";
-    std::cout << "    Max time:     " << (avg_time * 1.1) << " ms (estimated)\n";
+    std::cout << "    Min time:     " << min_time << " ms\n";
+    std::cout << "    Max time:     " << max_time << " ms\n";
 }
 
 //==========================================================================
@@ -359,12 +366,20 @@ int main(int argc, char** argv) {
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════════════════╗\n";
     std::cout << "║        MicroFlow Performance Benchmark                ║\n";
-    std::cout << "║        Raspberry Pi 4 Optimized v2.0                  ║\n";
+    std::cout << "║        ROCK 4D / ARM64 Optimized                      ║\n";
     std::cout << "╚════════════════════════════════════════════════════════╝\n";
 
     // 系统信息
     std::cout << "\n  System Information:\n";
-    std::cout << "    Architecture: " << (sizeof(void*) == 8 ? "ARM64" : "x86_64") << "\n";
+    std::cout << "    Architecture: " <<
+#if defined(__aarch64__)
+        "ARM64"
+#elif defined(__x86_64__)
+        "x86_64"
+#else
+        "other"
+#endif
+        << "\n";
     std::cout << "    Build Type: Release (O3)\n";
     std::cout << "    NEON: " <<
 #ifdef MICROFLOW_HAS_NEON

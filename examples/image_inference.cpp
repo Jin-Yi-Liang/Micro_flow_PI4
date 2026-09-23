@@ -1,37 +1,70 @@
-#include "microflow/runtime.hpp"
 #include "microflow/image.hpp"
+#include "microflow/runtime.hpp"
+
+#include <algorithm>
+#include <iomanip>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 
 using namespace microflow;
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) return 1;
-
-    // 加载图像
-    Tensor input;
-    if (!Image::load(argv[1], input)) return 1;
-
-    // 加载模型
-    Model model;
-    if (!model.load("../models/mnist_optimized.mflow")) return 1;
-
-    // 推理
-    Tensor output;
-    model.forward(input, output);
-
-    // 结果
-    const float* probs = output.raw_ptr();
-    int predicted = 0;
-    float max_prob = probs[0];
-    for (int i = 1; i < 10; ++i) {
-        if (probs[i] > max_prob) {
-            max_prob = probs[i];
-            predicted = i;
-        }
+int main(int argc, char** argv) {
+    if (argc < 3 || argc > 5) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <model.mflow> <image> [threads] [--preprocess]\n";
+        return 2;
     }
 
-    std::cout << "Predicted: " << predicted << "\n";
-    std::cout << "Confidence: " << (max_prob * 100.0f) << "%\n";
+    try {
+        int threads = 4;
+        bool preprocess = false;
+        for (int i = 3; i < argc; ++i) {
+            const std::string option = argv[i];
+            if (option == "--preprocess") {
+                preprocess = true;
+            } else {
+                threads = std::stoi(option);
+                if (threads <= 0) throw std::runtime_error("threads must be positive");
+            }
+        }
 
-    return 0;
+        Tensor loaded;
+        if (!Image::load(argv[2], loaded)) {
+            throw std::runtime_error("cannot load input image");
+        }
+
+        Tensor input({1, 28, 28});
+        const auto& shape = loaded.shapes();
+        if (preprocess) {
+            Image::preprocess_mnist(loaded, input);
+        } else if (shape.size() == 3 && shape[0] == 1 && shape[1] == 28 && shape[2] == 28) {
+            input = loaded;
+        } else {
+            Image::resize(loaded, input, 28, 28);
+        }
+
+        InferenceEngine::Config config;
+        config.num_threads = threads;
+        config.enable_profiling = true;
+        InferenceEngine engine(config);
+        if (!engine.load_model(argv[1])) throw std::runtime_error("cannot load model");
+
+        Tensor output({10});
+        engine.infer_into(input, output);
+        const float* scores = output.raw_ptr();
+        const int digit = static_cast<int>(
+            std::max_element(scores, scores + 10) - scores);
+
+        std::cout << "Digit: " << digit << '\n';
+        std::cout << std::fixed << std::setprecision(6)
+                  << "Confidence: " << scores[digit] << '\n';
+        std::cout << "Scores:";
+        for (int i = 0; i < 10; ++i) std::cout << ' ' << scores[i];
+        std::cout << '\n';
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "Image inference failed: " << error.what() << '\n';
+        return 1;
+    }
 }

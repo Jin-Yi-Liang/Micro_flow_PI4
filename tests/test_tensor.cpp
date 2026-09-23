@@ -120,6 +120,51 @@ TEST_BEGIN(tensor_zeros_ones) {
     }
 TEST_END()}
 
+TEST_BEGIN(tensor_transformations) {
+    Tensor input({2, 2, 3});
+    for (uint32_t i = 0; i < input.size(); ++i) input.raw_ptr()[i] = static_cast<float>(i);
+
+    Tensor transposed = input.transpose(0, 2);
+    TEST_ASSERT(transposed.shapes() == std::vector<uint32_t>({3, 2, 2}),
+                "3D transpose shape should match");
+    // output[2,1,0] = input[0,1,2] = 5
+    TEST_ASSERT(std::abs(transposed.raw_ptr()[10] - 5.0f) < 1e-6f,
+                "3D transpose data should match");
+
+    Tensor left({2, 2});
+    Tensor right({2, 1});
+    left.raw_ptr()[0] = 1; left.raw_ptr()[1] = 2;
+    left.raw_ptr()[2] = 3; left.raw_ptr()[3] = 4;
+    right.raw_ptr()[0] = 5; right.raw_ptr()[1] = 6;
+    Tensor joined = concat({left, right}, 1);
+    const float joined_expected[] = {1, 2, 5, 3, 4, 6};
+    TEST_ASSERT(joined.shapes() == std::vector<uint32_t>({2, 3}),
+                "Concat shape should match");
+    for (uint32_t i = 0; i < joined.size(); ++i) {
+        TEST_ASSERT(std::abs(joined.raw_ptr()[i] - joined_expected[i]) < 1e-6f,
+                    "Concat data should match");
+    }
+
+    auto pieces = split(joined, 3, 1);
+    TEST_ASSERT(pieces.size() == 3, "Split should return requested parts");
+    TEST_ASSERT(pieces[0].shapes() == std::vector<uint32_t>({2, 1}),
+                "Split shape should match");
+    TEST_ASSERT(pieces[0].raw_ptr()[0] == 1 && pieces[0].raw_ptr()[1] == 3 &&
+                pieces[2].raw_ptr()[0] == 5 && pieces[2].raw_ptr()[1] == 6,
+                "Split data should match");
+
+    Tensor a({2, 3});
+    Tensor b({3, 2});
+    for (uint32_t i = 0; i < a.size(); ++i) a.raw_ptr()[i] = static_cast<float>(i + 1);
+    for (uint32_t i = 0; i < b.size(); ++i) b.raw_ptr()[i] = static_cast<float>(i + 1);
+    Tensor product = matmul(a, b);
+    const float product_expected[] = {22, 28, 49, 64};
+    for (uint32_t i = 0; i < product.size(); ++i) {
+        TEST_ASSERT(std::abs(product.raw_ptr()[i] - product_expected[i]) < 1e-5f,
+                    "Matmul data should match");
+    }
+TEST_END()}
+
 //==========================================================================
 // 分配器测试
 //==========================================================================
@@ -182,6 +227,7 @@ int main() {
     RUN_TEST(tensor_reshape);
     RUN_TEST(tensor_operations);
     RUN_TEST(tensor_zeros_ones);
+    RUN_TEST(tensor_transformations);
     RUN_TEST(allocator_basic);
     RUN_TEST(allocator_alignment);
 

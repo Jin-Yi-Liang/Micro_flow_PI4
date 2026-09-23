@@ -19,7 +19,12 @@ bool Image::load(const std::string& filename,
                  bool grayscale)
 {
     // 检查文件扩展名
-    std::string ext = filename.substr(filename.find_last_of('.'));
+    const size_t dot = filename.find_last_of('.');
+    if (dot == std::string::npos) {
+        std::cerr << "ERROR: Input file has no extension: " << filename << "\n";
+        return false;
+    }
+    std::string ext = filename.substr(dot);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
     if (ext == ".bin") {
@@ -108,8 +113,11 @@ bool Image::load(const std::string& filename,
             // 转灰度
             Tensor rgb({3, static_cast<uint32_t>(height), static_cast<uint32_t>(width)});
             float* rgb_ptr = rgb.raw_ptr();
-            for (size_t i = 0; i < buffer.size(); ++i) {
-                rgb_ptr[i] = static_cast<float>(buffer[i]) / 255.0f;
+            const size_t plane = static_cast<size_t>(width) * height;
+            for (size_t i = 0; i < plane; ++i) {
+                rgb_ptr[i] = static_cast<float>(buffer[i * 3]) / 255.0f;
+                rgb_ptr[plane + i] = static_cast<float>(buffer[i * 3 + 1]) / 255.0f;
+                rgb_ptr[2 * plane + i] = static_cast<float>(buffer[i * 3 + 2]) / 255.0f;
             }
 
             Tensor gray;
@@ -301,8 +309,6 @@ void Image::binarize(const Tensor& input,
                     float threshold)
 {
     const auto& shapes = input.shapes();
-    uint32_t height = shapes[0 == shapes.size() - 3 ? 1 : 0];
-    uint32_t width = shapes[shapes.size() - 1];
     uint32_t size = input.size();
 
     // 复制输入到输出
@@ -426,10 +432,7 @@ void Image::preprocess_mnist(const Tensor& input, Tensor& output)
         current = gray;
     }
 
-    const auto& shapes = current.shapes();
-    uint32_t height = shapes[shapes.size() - 2];
-    uint32_t width = shapes[shapes.size() - 1];
-    uint32_t size = current.size();
+    const uint32_t size = current.size();
     const float* ptr = current.raw_ptr();
 
     // 使用图像整体统计来判断颜色格式
@@ -437,13 +440,8 @@ void Image::preprocess_mnist(const Tensor& input, Tensor& output)
     // 拍照格式: 白底(1)黑字(0)，背景占大多数
 
     float sum = 0;
-    int dark_count = 0;  // <0.5的像素数
-    int bright_count = 0; // >=0.5的像素数
-
     for (uint32_t i = 0; i < size; ++i) {
         sum += ptr[i];
-        if (ptr[i] < 0.5f) dark_count++;
-        else bright_count++;
     }
 
     float avg = sum / size;
@@ -461,27 +459,114 @@ void Image::preprocess_mnist(const Tensor& input, Tensor& output)
         processed = current;
     }
 
-    // 自动裁剪边框
-    // 使用更低的阈值来检测内容，确保能找到笔画
+    // 自动裁剪边框。输入可能是高分辨率的细笔画，因此不在源分辨率
+    // 上增加固定 padding，避免 padding 比例随图片尺寸发生巨大变化。
     Tensor cropped;
-    auto_crop(processed, cropped, 8, 0.01f);  // 降低阈值到0.01，增加padding
+    auto_crop(processed, cropped, 0, 0.02f);
 
-    // 检查裁剪结果
     const auto& crop_shapes = cropped.shapes();
-    const auto& orig_shapes = processed.shapes();
+    const uint32_t crop_h = crop_shapes[crop_shapes.size() - 2];
+    const uint32_t crop_w = crop_shapes[crop_shapes.size() - 1];
+    if (crop_h == 0 || crop_w == 0) {
+        output = Tensor({1, 28, 28});
+        output.fill(0.0f);
+        return;
+    }
 
-    uint32_t crop_h = crop_shapes[crop_shapes.size() - 2];
-    uint32_t crop_w = crop_shapes[crop_shapes.size() - 1];
-    uint32_t orig_h = orig_shapes[orig_shapes.size() - 2];
-    uint32_t orig_w = orig_shapes[orig_shapes.size() - 1];
-
-    // 如果裁剪后图像明显比原图小（至少在一个方向上小于80%），说明成功裁剪
-    if (crop_h < orig_h * 0.8f || crop_w < orig_w * 0.8f) {
-        // 使用裁剪后的图像
-        resize(cropped, output, 28, 28);
+    // MNIST 字符通常位于约 20x20 的内容框内。保持宽高比缩放，给
+    // 28x28 画布留下稳定边距。高分辨率下采样采用区域最大值，避免
+    // 一到两个像素宽的手写笔画被双线性采样漏掉。
+    constexpr uint32_t content_size = 20;
+    uint32_t target_h = content_size;
+    uint32_t target_w = content_size;
+    if (crop_h >= crop_w) {
+        target_w = std::max(1u, static_cast<uint32_t>(
+            std::lround(static_cast<double>(content_size) * crop_w / crop_h)));
     } else {
-        // 裁剪没有效果，使用原图
-        resize(processed, output, 28, 28);
+        target_h = std::max(1u, static_cast<uint32_t>(
+            std::lround(static_cast<double>(content_size) * crop_h / crop_w)));
+    }
+
+    Tensor scaled({1, target_h, target_w});
+    if (crop_h > target_h || crop_w > target_w) {
+        const float* source = cropped.raw_ptr();
+        float* destination = scaled.raw_ptr();
+        for (uint32_t y = 0; y < target_h; ++y) {
+            const uint32_t y0 = y * crop_h / target_h;
+            const uint32_t y1 = std::max(y0 + 1, (y + 1) * crop_h / target_h);
+            for (uint32_t x = 0; x < target_w; ++x) {
+                const uint32_t x0 = x * crop_w / target_w;
+                const uint32_t x1 = std::max(x0 + 1, (x + 1) * crop_w / target_w);
+                float value = 0.0f;
+                for (uint32_t sy = y0; sy < std::min(y1, crop_h); ++sy) {
+                    for (uint32_t sx = x0; sx < std::min(x1, crop_w); ++sx) {
+                        value = std::max(value, source[sy * crop_w + sx]);
+                    }
+                }
+                destination[y * target_w + x] = value;
+            }
+        }
+    } else {
+        resize(cropped, scaled, target_h, target_w);
+    }
+
+    Tensor canvas({1, 28, 28});
+    canvas.fill(0.0f);
+    const int offset_y = (28 - static_cast<int>(target_h)) / 2;
+    const int offset_x = (28 - static_cast<int>(target_w)) / 2;
+    for (uint32_t y = 0; y < target_h; ++y) {
+        for (uint32_t x = 0; x < target_w; ++x) {
+            canvas.raw_ptr()[(offset_y + y) * 28 + offset_x + x] =
+                scaled.raw_ptr()[y * target_w + x];
+        }
+    }
+
+    // 一次 3x3 最大值膨胀让细线条接近 MNIST 的笔画宽度。
+    Tensor thickened({1, 28, 28});
+    thickened.fill(0.0f);
+    for (int y = 0; y < 28; ++y) {
+        for (int x = 0; x < 28; ++x) {
+            float value = 0.0f;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int sy = y + dy;
+                    const int sx = x + dx;
+                    if (sy >= 0 && sy < 28 && sx >= 0 && sx < 28) {
+                        value = std::max(value, canvas.raw_ptr()[sy * 28 + sx]);
+                    }
+                }
+            }
+            thickened.raw_ptr()[y * 28 + x] = value;
+        }
+    }
+
+    // 按灰度质心平移到 MNIST 画布中心。
+    double mass = 0.0;
+    double center_y = 0.0;
+    double center_x = 0.0;
+    for (int y = 0; y < 28; ++y) {
+        for (int x = 0; x < 28; ++x) {
+            const double value = thickened.raw_ptr()[y * 28 + x];
+            mass += value;
+            center_y += y * value;
+            center_x += x * value;
+        }
+    }
+
+    output = Tensor({1, 28, 28});
+    output.fill(0.0f);
+    const int shift_y = mass > 0.0 ? static_cast<int>(std::lround(13.5 - center_y / mass)) : 0;
+    const int shift_x = mass > 0.0 ? static_cast<int>(std::lround(13.5 - center_x / mass)) : 0;
+    for (int y = 0; y < 28; ++y) {
+        for (int x = 0; x < 28; ++x) {
+            const int destination_y = y + shift_y;
+            const int destination_x = x + shift_x;
+            if (destination_y >= 0 && destination_y < 28 &&
+                destination_x >= 0 && destination_x < 28) {
+                output.raw_ptr()[destination_y * 28 + destination_x] =
+                    thickened.raw_ptr()[y * 28 + x];
+            }
+        }
     }
 }
 

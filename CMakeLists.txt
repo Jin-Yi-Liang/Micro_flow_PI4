@@ -1,9 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 project(MicroFlow
-    VERSION 2.0
-    DESCRIPTION "Lightweight Inference Engine for Raspberry Pi 4"
+    VERSION 4.0
+    DESCRIPTION "Lightweight ARM64 inference engine optimized for Radxa ROCK 4D"
     LANGUAGES CXX
 )
+
+include(CTest)
 
 # 1. 基础环境设置
 set(CMAKE_CXX_STANDARD 17)
@@ -26,10 +28,10 @@ add_library(microflow_core STATIC
     src/runtime/runtime.cpp
 )
 
-# 3. 硬件架构专项优化 (针对树莓派4 Cortex-A72)
+# 3. 硬件架构专项优化 (ROCK 4D 的 Cortex-A72 大核)
 # ============================================================================
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
-    message(STATUS "Configuring for Raspberry Pi 4 (ARM64)")
+    message(STATUS "Configuring MicroFlow for ROCK 4D Cortex-A72 big cores (ARM64)")
 
     target_compile_options(microflow_core PRIVATE
         -march=armv8-a
@@ -97,6 +99,44 @@ target_link_libraries(image_preprocess microflow_core)
 # 图像加载测试
 add_executable(test_image tests/test_image.cpp)
 target_link_libraries(test_image microflow_core)
+target_compile_definitions(test_image PRIVATE MICROFLOW_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+add_executable(test_tensor tests/test_tensor.cpp)
+target_link_libraries(test_tensor microflow_core)
+
+add_executable(test_operators tests/test_operators.cpp)
+target_link_libraries(test_operators microflow_core)
+
+add_executable(test_runtime tests/test_runtime.cpp)
+target_link_libraries(test_runtime microflow_core)
+target_compile_definitions(test_runtime PRIVATE MICROFLOW_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+add_executable(mnist_eval tests/mnist_eval.cpp)
+target_link_libraries(mnist_eval microflow_core)
+
+add_executable(quantization_eval tests/quantization_eval.cpp)
+target_link_libraries(quantization_eval microflow_core)
+
+if(BUILD_TESTING)
+    add_test(NAME tensor COMMAND test_tensor)
+    add_test(NAME image COMMAND test_image)
+    add_test(NAME operators COMMAND test_operators)
+    add_test(NAME runtime COMMAND test_runtime)
+    add_test(NAME mnist_smoke
+        COMMAND mnist_demo
+            ${CMAKE_SOURCE_DIR}/models/mnist_improved.mflow
+            ${CMAKE_SOURCE_DIR}/image/test_input.bin)
+    set_tests_properties(mnist_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "Predicted Digit: \\[7\\]")
+
+    add_test(NAME handwritten_image
+        COMMAND image_inference
+            ${CMAKE_SOURCE_DIR}/models/mnist_improved.mflow
+            ${CMAKE_SOURCE_DIR}/image/image_7.png
+            4 --preprocess)
+    set_tests_properties(handwritten_image PROPERTIES
+        PASS_REGULAR_EXPRESSION "Digit: 7")
+endif()
 
 # Web手写识别服务
 add_executable(web_demo examples/web_demo.cpp)

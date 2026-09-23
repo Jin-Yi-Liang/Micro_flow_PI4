@@ -323,8 +323,6 @@ void avg_pool2d(const Tensor& input, Tensor& output,
     const float* in_ptr = input.raw_ptr();
     float* out_ptr = output.raw_ptr();
 
-    float inv_ksqr = 1.0f / (kernel_size * kernel_size);
-
     #pragma omp parallel for collapse(2)
     for (int c = 0; c < C; ++c) {
         for (int h_out = 0; h_out < H_out; ++h_out) {
@@ -391,9 +389,6 @@ void adaptive_avg_pool2d(const Tensor& input, Tensor& output,
     // 计算步长和核大小
     int stride_h = (H - 1) / output_height + 1;
     int stride_w = (W - 1) / output_width + 1;
-    int kernel_h = stride_h + (H - 1) % output_height + 1;
-    int kernel_w = stride_w + (W - 1) % output_width + 1;
-
     // 简化实现: 使用固定步长
     #pragma omp parallel for collapse(3)
     for (int c = 0; c < C; ++c) {
@@ -572,9 +567,7 @@ void linear(const Tensor& input,
             }
         }
     } else if (input.ndim() == 2) {
-        int batch = input.shapes()[0];
         int in_features = input.shapes()[1];
-        int out_features;
 
         bool is_transposed = (weight.shapes()[0] == static_cast<uint32_t>(in_features));
 
@@ -582,10 +575,8 @@ void linear(const Tensor& input,
         Tensor weight_transposed;
 
         if (is_transposed) {
-            out_features = weight.shapes()[1];
             weight_ptr = &weight;
         } else {
-            out_features = weight.shapes()[0];
             weight_transposed = weight.transpose(0, 1);
             weight_ptr = &weight_transposed;
         }
@@ -855,7 +846,7 @@ void fill(Tensor& input, float value) {
 }
 
 Tensor eye(int n) {
-    Tensor result({n, n});
+    Tensor result({static_cast<uint32_t>(n), static_cast<uint32_t>(n)});
     result.fill(0.0f);
 
     float* ptr = result.raw_ptr();
@@ -869,7 +860,7 @@ Tensor eye(int n) {
 Tensor diag(const Tensor& input) {
     // 简化实现: 假设输入是1D的
     int n = input.size();
-    Tensor result({n, n});
+    Tensor result({static_cast<uint32_t>(n), static_cast<uint32_t>(n)});
     result.fill(0.0f);
 
     const float* in_ptr = input.raw_ptr();

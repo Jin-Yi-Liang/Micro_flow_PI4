@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_DIR="${MICROFLOW_BUILD_DIR:-${ROOT_DIR}/build-rock4d}"
+MODEL="${MICROFLOW_MODEL:-${ROOT_DIR}/models/mnist_improved.mflow}"
+DATA_DIR="${MICROFLOW_DATA_DIR:-${ROOT_DIR}/data/MNIST/raw}"
+THREADS="${MICROFLOW_THREADS:-4}"
+BIG_CORES="${MICROFLOW_BIG_CORES:-4-7}"
+
+run_on_big_cores() {
+    OMP_PROC_BIND=true OMP_PLACES=cores taskset -c "${BIG_CORES}" "$@"
+}
+
+build() {
+    cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build "${BUILD_DIR}" -j"$(nproc)"
+}
+
+test_system() {
+    build
+    ctest --test-dir "${BUILD_DIR}" --output-on-failure
+}
+
+evaluate() {
+    local limit="${1:-10000}"
+    build
+    if [[ ! -f "${DATA_DIR}/t10k-images-idx3-ubyte" ||
+          ! -f "${DATA_DIR}/t10k-labels-idx1-ubyte" ]]; then
+        python3 "${ROOT_DIR}/tools/download_mnist.py" "${ROOT_DIR}/data/MNIST"
+    fi
+    run_on_big_cores "${BUILD_DIR}/mnist_eval" "${MODEL}" \
+        "${DATA_DIR}/t10k-images-idx3-ubyte" \
+        "${DATA_DIR}/t10k-labels-idx1-ubyte" "${limit}" "${THREADS}"
+}
+
+demo() {
+    build
+    local image="${1:-${ROOT_DIR}/image/test_input.bin}"
+    local iterations="${2:-1000}"
+    run_on_big_cores "${BUILD_DIR}/mnist_demo" "${MODEL}" "${image}" \
+        "${iterations}" "${THREADS}"
+}
+
+serve() {
+    build
+    local port="${1:-8080}"
+    echo "MicroFlow UI: http://$(hostname -I | awk '{print $1}'):${port}"
+    run_on_big_cores "${BUILD_DIR}/web_demo" "${MODEL}" "${port}" "${THREADS}"
+}
+
+case "${1:-help}" in
+    build) build ;;
+    test) test_system ;;
+    eval) evaluate "${2:-10000}" ;;
+    demo) demo "${2:-${ROOT_DIR}/image/test_input.bin}" "${3:-1000}" ;;
+    serve) serve "${2:-8080}" ;;
+    *)
+        echo "Usage: $0 {build|test|eval [count]|demo [image] [iterations]|serve [port]}"
+        exit 2
+        ;;
+esac

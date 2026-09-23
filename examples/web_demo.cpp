@@ -2,7 +2,7 @@
  * @file web_demo.cpp
  * @brief MicroFlow Web服务 - 手写数字识别HTTP API
  *
- * @启动: ./web_demo <model_path> [port]
+ * @启动: ./web_demo <model_path> [port] [threads]
  * @访问: http://localhost:8080
  */
 
@@ -11,6 +11,9 @@
 #include "microflow/image.hpp"
 #include "microflow/httplib.h"
 #include <iostream>
+#include <array>
+#include <cmath>
+#include <mutex>
 #include <string>
 #include <sstream>
 #include <iomanip>
@@ -19,6 +22,59 @@ using namespace microflow;
 
 // 全局推理引擎
 InferenceEngine* g_engine = nullptr;
+std::mutex g_request_mutex;
+
+bool parse_pixels(const std::string& body, std::vector<float>& pixels,
+                  std::string& error) {
+    const size_t key = body.find("\"pixels\"");
+    if (key == std::string::npos) {
+        error = "Missing pixels field";
+        return false;
+    }
+    const size_t pixels_start = body.find('[', key);
+    const size_t pixels_end = body.find(']', pixels_start);
+    if (pixels_start == std::string::npos || pixels_end == std::string::npos) {
+        error = "Invalid pixels array";
+        return false;
+    }
+
+    std::stringstream stream(body.substr(pixels_start + 1,
+                                         pixels_end - pixels_start - 1));
+    std::string token;
+    pixels.clear();
+    pixels.reserve(784);
+    try {
+        while (std::getline(stream, token, ',')) {
+            const size_t first = token.find_first_not_of(" \t\n\r");
+            if (first == std::string::npos) continue;
+            const size_t last = token.find_last_not_of(" \t\n\r");
+            size_t consumed = 0;
+            const float value = std::stof(token.substr(first, last - first + 1), &consumed);
+            if (consumed != last - first + 1 || !std::isfinite(value) ||
+                value < 0.0f || value > 1.0f) {
+                error = "Pixels must be finite numbers in [0, 1]";
+                return false;
+            }
+            pixels.push_back(value);
+            if (pixels.size() > 784) break;
+        }
+    } catch (const std::exception&) {
+        error = "Pixels must be valid numbers";
+        return false;
+    }
+
+    if (pixels.size() != 784) {
+        error = "Expected 784 pixels, got " + std::to_string(pixels.size());
+        return false;
+    }
+    return true;
+}
+
+void set_cors(httplib::Response& res) {
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+}
 
 /**
  * @brief 将Tensor转换为JSON字符串
@@ -57,10 +113,7 @@ std::string tensor_to_json(const Tensor& output) {
  * @brief 处理识别请求
  */
 void handle_predict(const httplib::Request& req, httplib::Response& res) {
-    // 设置CORS
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    set_cors(res);
 
     // 处理OPTIONS预检请求
     if (req.method == "OPTIONS") {
@@ -69,59 +122,21 @@ void handle_predict(const httplib::Request& req, httplib::Response& res) {
     }
 
     try {
-        // 解析JSON请求
-        // 格式: {"pixels": [0.1, 0.2, ..., 784个值]}
-        auto body = req.body;
-
-        // 简单解析（生产环境应使用json库）
-        size_t pixels_start = body.find("\"pixels\":");
-        if (pixels_start == std::string::npos) {
-            res.status = 400;
-            res.set_content("{\"error\":\"Invalid request format\"}", "application/json");
-            return;
-        }
-
-        pixels_start = body.find("[", pixels_start);
-        size_t pixels_end = body.find("]", pixels_start);
-
-        if (pixels_start == std::string::npos || pixels_end == std::string::npos) {
-            res.status = 400;
-            res.set_content("{\"error\":\"Invalid pixels format\"}", "application/json");
-            return;
-        }
-
-        // 提取像素数据
-        std::string pixels_str = body.substr(pixels_start + 1, pixels_end - pixels_start - 1);
         std::vector<float> pixels;
-        std::stringstream ss(pixels_str);
-        std::string token;
-
-        while (std::getline(ss, token, ',')) {
-            // 去除空白
-            token.erase(0, token.find_first_not_of(" \t\n\r"));
-            token.erase(token.find_last_not_of(" \t\n\r") + 1);
-            if (!token.empty()) {
-                pixels.push_back(std::stof(token));
-            }
-        }
-
-        // 验证数据长度
-        if (pixels.size() != 784) {
+        std::string error;
+        if (!parse_pixels(req.body, pixels, error)) {
             res.status = 400;
-            res.set_content("{\"error\":\"Expected 784 pixels, got " +
-                           std::to_string(pixels.size()) + "\"}", "application/json");
+            res.set_content("{\"error\":\"" + error + "\"}", "application/json");
             return;
         }
 
-        // 创建输入Tensor
-        Tensor input({1, 28, 28});
-        std::memcpy(input.raw_ptr(), pixels.data(), 784 * sizeof(float));
+        std::array<float, 10> scores{};
+        Tensor input({1, 28, 28}, pixels.data());
+        Tensor output({10}, scores.data());
 
-        // 执行推理
-        Tensor output = g_engine->infer(input);
-
-        // 返回JSON结果
-        std::string json_result = tensor_to_json(output);
+        std::lock_guard<std::mutex> request_lock(g_request_mutex);
+        g_engine->infer_into(input, output);
+        const std::string json_result = tensor_to_json(output);
         res.set_content(json_result, "application/json");
 
     } catch (const std::exception& e) {
@@ -134,9 +149,7 @@ void handle_predict(const httplib::Request& req, httplib::Response& res) {
  * @brief 处理可视化请求 - 返回中间层激活图
  */
 void handle_visualize(const httplib::Request& req, httplib::Response& res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    set_cors(res);
 
     if (req.method == "OPTIONS") {
         res.status = 200;
@@ -144,51 +157,20 @@ void handle_visualize(const httplib::Request& req, httplib::Response& res) {
     }
 
     try {
-        auto body = req.body;
-        size_t pixels_start = body.find("\"pixels\":");
-        if (pixels_start == std::string::npos) {
-            res.status = 400;
-            res.set_content("{\"error\":\"Invalid request format\"}", "application/json");
-            return;
-        }
-
-        pixels_start = body.find("[", pixels_start);
-        size_t pixels_end = body.find("]", pixels_start);
-
-        if (pixels_start == std::string::npos || pixels_end == std::string::npos) {
-            res.status = 400;
-            res.set_content("{\"error\":\"Invalid pixels format\"}", "application/json");
-            return;
-        }
-
-        std::string pixels_str = body.substr(pixels_start + 1, pixels_end - pixels_start - 1);
         std::vector<float> pixels;
-        std::stringstream ss(pixels_str);
-        std::string token;
-
-        while (std::getline(ss, token, ',')) {
-            token.erase(0, token.find_first_not_of(" \t\n\r"));
-            token.erase(token.find_last_not_of(" \t\n\r") + 1);
-            if (!token.empty()) {
-                pixels.push_back(std::stof(token));
-            }
-        }
-
-        if (pixels.size() != 784) {
+        std::string error;
+        if (!parse_pixels(req.body, pixels, error)) {
             res.status = 400;
-            res.set_content("{\"error\":\"Expected 784 pixels, got " + std::to_string(pixels.size()) + "\"}", "application/json");
+            res.set_content("{\"error\":\"" + error + "\"}", "application/json");
             return;
         }
 
-        // 创建输入张量
-        Tensor input({1, 28, 28});
-        std::memcpy(input.raw_ptr(), pixels.data(), 784 * sizeof(float));
-
-        // 执行推理
-        Tensor output = g_engine->infer(input);
-
-        // 获取中间层输出
-        std::vector<Tensor> intermediates = g_engine->get_intermediate_outputs();
+        std::array<float, 10> scores{};
+        Tensor input({1, 28, 28}, pixels.data());
+        Tensor output({10}, scores.data());
+        std::lock_guard<std::mutex> request_lock(g_request_mutex);
+        g_engine->infer_into(input, output);
+        const std::vector<Tensor> intermediates = g_engine->get_intermediate_outputs();
 
         // 找出预测的数字
         const float* out_ptr = output.raw_ptr();
@@ -487,6 +469,9 @@ void handle_index(const httplib::Request& req, httplib::Response& res) {
                 });
 
                 const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.error || ('HTTP ' + response.status));
+                }
 
                 document.getElementById('digit').textContent = data.digit;
                 document.getElementById('confidence').textContent =
@@ -500,32 +485,95 @@ void handle_index(const httplib::Request& req, httplib::Response& res) {
             }
         });
 
-        // 压缩图像到28x28
+        // 裁剪、保持比例缩放并居中到 MNIST 的 28x28 布局。
         function compressTo28x28(imageData) {
             const srcData = imageData.data;
-            const output = new Array(784);
-
-            // 使用双线性插值缩放到28x28
-            const scaleX = 280 / 28;
-            const scaleY = 280 / 28;
-
-            for (let y = 0; y < 28; y++) {
-                for (let x = 0; x < 28; x++) {
-                    // 对应源图像的中心位置
-                    const srcX = Math.floor(x * scaleX + scaleX / 2);
-                    const srcY = Math.floor(y * scaleY + scaleY / 2);
-
-                    if (srcX < 280 && srcY < 280) {
-                        const idx = (srcY * 280 + srcX) * 4;
-                        // RGB转灰度，然后反色
-                        const gray = (srcData[idx] + srcData[idx + 1] + srcData[idx + 2]) / 3 / 255;
-                        output[y * 28 + x] = 1.0 - gray;  // 反色
-                    } else {
-                        output[y * 28 + x] = 1.0;  // 背景（黑色）
+            let left = 280, right = -1, top = 280, bottom = -1;
+            for (let y = 0; y < 280; y++) {
+                for (let x = 0; x < 280; x++) {
+                    const index = (y * 280 + x) * 4;
+                    const darkness = 1 - (srcData[index] + srcData[index + 1] + srcData[index + 2]) / 765;
+                    if (darkness > 0.03) {
+                        left = Math.min(left, x);
+                        right = Math.max(right, x);
+                        top = Math.min(top, y);
+                        bottom = Math.max(bottom, y);
                     }
                 }
             }
 
+            if (right < left || bottom < top) {
+                throw new Error('请先在画布中写一个数字');
+            }
+
+            const width = right - left + 1;
+            const height = bottom - top + 1;
+            const scale = 20 / Math.max(width, height);
+            const targetWidth = Math.max(1, Math.round(width * scale));
+            const targetHeight = Math.max(1, Math.round(height * scale));
+
+            const normalized = document.createElement('canvas');
+            normalized.width = 28;
+            normalized.height = 28;
+            const normalizedContext = normalized.getContext('2d');
+            normalizedContext.fillStyle = 'white';
+            normalizedContext.fillRect(0, 0, 28, 28);
+            normalizedContext.imageSmoothingEnabled = true;
+            normalizedContext.imageSmoothingQuality = 'high';
+            normalizedContext.drawImage(
+                canvas, left, top, width, height,
+                Math.floor((28 - targetWidth) / 2),
+                Math.floor((28 - targetHeight) / 2),
+                targetWidth, targetHeight
+            );
+
+            const normalizedData = normalizedContext.getImageData(0, 0, 28, 28).data;
+            const pixels = new Array(784);
+            for (let i = 0; i < 784; i++) {
+                pixels[i] = 1 - (normalizedData[i * 4] + normalizedData[i * 4 + 1] +
+                    normalizedData[i * 4 + 2]) / 765;
+            }
+
+            // 轻微加粗并按灰度质心居中，匹配训练集分布。
+            const thickened = new Array(784).fill(0);
+            for (let y = 0; y < 28; y++) {
+                for (let x = 0; x < 28; x++) {
+                    let value = 0;
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dx = -1; dx <= 1; dx++) {
+                            const sy = y + dy;
+                            const sx = x + dx;
+                            if (sy >= 0 && sy < 28 && sx >= 0 && sx < 28) {
+                                value = Math.max(value, pixels[sy * 28 + sx]);
+                            }
+                        }
+                    }
+                    thickened[y * 28 + x] = value;
+                }
+            }
+
+            let mass = 0, centerX = 0, centerY = 0;
+            for (let y = 0; y < 28; y++) {
+                for (let x = 0; x < 28; x++) {
+                    const value = thickened[y * 28 + x];
+                    mass += value;
+                    centerX += x * value;
+                    centerY += y * value;
+                }
+            }
+            const shiftX = mass > 0 ? Math.round(13.5 - centerX / mass) : 0;
+            const shiftY = mass > 0 ? Math.round(13.5 - centerY / mass) : 0;
+            const output = new Array(784).fill(0);
+            for (let y = 0; y < 28; y++) {
+                for (let x = 0; x < 28; x++) {
+                    const destinationX = x + shiftX;
+                    const destinationY = y + shiftY;
+                    if (destinationX >= 0 && destinationX < 28 &&
+                        destinationY >= 0 && destinationY < 28) {
+                        output[destinationY * 28 + destinationX] = thickened[y * 28 + x];
+                    }
+                }
+            }
             return output;
         }
     </script>
@@ -546,11 +594,12 @@ int main(int argc, char** argv) {
     std::cout << "\n";
 
     // 检查参数
-    if (argc < 2) {
-        std::cout << "Usage: " << argv[0] << " <model_path> [port]\n\n";
+    if (argc < 2 || argc > 4) {
+        std::cout << "Usage: " << argv[0] << " <model_path> [port] [threads]\n\n";
         std::cout << "Arguments:\n";
         std::cout << "  model_path  - Path to .mflow model file\n";
         std::cout << "  port        - HTTP server port (default: 8080)\n\n";
+        std::cout << "  threads     - Inference threads (default: 4)\n\n";
         std::cout << "Example:\n";
         std::cout << "  " << argv[0] << " models/mnist_mixed.mflow 8080\n\n";
         return 1;
@@ -558,14 +607,23 @@ int main(int argc, char** argv) {
 
     std::string model_path = argv[1];
     int port = 8080;
-    if (argc > 2) {
-        port = std::atoi(argv[2]);
+    int threads = 4;
+    try {
+        if (argc > 2) port = std::stoi(argv[2]);
+        if (argc > 3) threads = std::stoi(argv[3]);
+    } catch (const std::exception&) {
+        std::cerr << "Error: port and threads must be integers\n";
+        return 2;
+    }
+    if (port < 1 || port > 65535 || threads < 1 || threads > 64) {
+        std::cerr << "Error: port must be 1..65535 and threads must be 1..64\n";
+        return 2;
     }
 
     // 创建并配置推理引擎
     std::cout << "Initializing inference engine...\n";
     InferenceEngine::Config config;
-    config.num_threads = 4;
+    config.num_threads = threads;
 
     static InferenceEngine engine(config);
     g_engine = &engine;
@@ -583,8 +641,17 @@ int main(int argc, char** argv) {
 
     // 注册路由
     svr.Get("/", handle_index);
+    svr.Get("/health", [threads](const httplib::Request&, httplib::Response& res) {
+        set_cors(res);
+        res.set_content("{\"status\":\"ok\",\"model\":\"mnist_improved\",\"threads\":" +
+                        std::to_string(threads) + "}", "application/json");
+    });
     svr.Post("/predict", handle_predict);
     svr.Post("/visualize", handle_visualize);
+    svr.Options(R"(/(.*))", [](const httplib::Request&, httplib::Response& res) {
+        set_cors(res);
+        res.status = 204;
+    });
 
     // 启动服务器
     std::cout << "╔════════════════════════════════════════════╗\n";

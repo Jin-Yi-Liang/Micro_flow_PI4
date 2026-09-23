@@ -156,6 +156,18 @@ void conv2d_winograd(const Tensor& input,
                     Tensor& output,
                     const Conv2DParams& params);
 
+/** Transform [F,C,3,3] kernels once for Winograd F(2x2,3x3). */
+void winograd_transform_kernel_3x3(const Tensor& kernel, Tensor& transformed);
+
+/** Execute Winograd F(2x2,3x3) with pre-transformed [F,C,16] kernels. */
+void conv2d_winograd_f2x2(const Tensor& input,
+                          const Tensor& transformed_kernel,
+                          const Tensor& bias,
+                          Tensor& output,
+                          bool apply_relu,
+                          float* workspace,
+                          bool apply_maxpool = false);
+
 //==========================================================================
 // Depthwise卷积
 //==========================================================================

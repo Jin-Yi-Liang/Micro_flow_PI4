@@ -1,4 +1,5 @@
 #include "microflow/tensor.hpp"
+#include "microflow/gemm.hpp"
 #include <stdexcept>
 #include <random>
 #include <iomanip>
@@ -282,8 +283,8 @@ Tensor Tensor::transpose(uint32_t dim0, uint32_t dim1) const {
         return result;
     }
 
-    // 高维张量需要创建新数据
-    // 简化实现：这里先不优化
+    // 高维张量创建连续数据副本。输出坐标交换回输入坐标后，使用
+    // 原始 stride 计算源元素位置。
     Tensor result;
     result.shapes_ = shapes_;
     std::swap(result.shapes_[dim0], result.shapes_[dim1]);
@@ -291,7 +292,21 @@ Tensor Tensor::transpose(uint32_t dim0, uint32_t dim1) const {
     result.compute_strides();
     result.allocate_memory();
 
-    // TODO: 实现通用转置逻辑
+    std::vector<uint32_t> coordinates(shapes_.size());
+    for (uint32_t output_index = 0; output_index < result.size_; ++output_index) {
+        uint32_t remainder = output_index;
+        for (size_t axis = 0; axis < result.shapes_.size(); ++axis) {
+            coordinates[axis] = remainder / result.strides_[axis];
+            remainder %= result.strides_[axis];
+        }
+        std::swap(coordinates[dim0], coordinates[dim1]);
+
+        uint32_t input_index = 0;
+        for (size_t axis = 0; axis < coordinates.size(); ++axis) {
+            input_index += coordinates[axis] * strides_[axis];
+        }
+        result.raw_ptr()[output_index] = raw_ptr()[input_index];
+    }
 
     return result;
 }
@@ -476,10 +491,6 @@ Tensor mul(const Tensor& a, const Tensor& b) {
 }
 
 Tensor matmul(const Tensor& a, const Tensor& b) {
-    // 简化实现：2D矩阵乘法
-    // 将在gemm模块中实现优化版本
-    // 这里只是一个占位符
-
     if (a.ndim() != 2 || b.ndim() != 2) {
         throw std::invalid_argument("matmul: only 2D tensors supported");
     }
@@ -488,10 +499,7 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     }
 
     Tensor result({a.shapes()[0], b.shapes()[1]}, a.layout());
-
-    // 调用优化的GEMM实现
-    // gemm_neon(...);  // 将在gemm模块中实现
-
+    gemm(a, b, result);
     return result;
 }
 
@@ -500,34 +508,84 @@ Tensor concat(const std::vector<Tensor>& tensors, uint32_t dim) {
         throw std::invalid_argument("concat: no tensors provided");
     }
 
-    // 计算输出形状
+    if (dim >= tensors[0].ndim()) {
+        throw std::out_of_range("concat: dimension out of range");
+    }
+
+    // 计算输出形状并验证除拼接维度以外的形状。
     std::vector<uint32_t> out_shapes = tensors[0].shapes();
     out_shapes[dim] = 0;
     for (const auto& t : tensors) {
+        if (t.ndim() != tensors[0].ndim()) {
+            throw std::invalid_argument("concat: rank mismatch");
+        }
+        for (uint32_t axis = 0; axis < t.ndim(); ++axis) {
+            if (axis != dim && t.shapes()[axis] != tensors[0].shapes()[axis]) {
+                throw std::invalid_argument("concat: shape mismatch");
+            }
+        }
         out_shapes[dim] += t.shapes()[dim];
     }
 
     Tensor result(out_shapes, tensors[0].layout());
     float* dst_ptr = result.raw_ptr();
-    size_t offset = 0;
+    const size_t inner = std::accumulate(
+        out_shapes.begin() + dim + 1, out_shapes.end(), size_t{1},
+        std::multiplies<size_t>());
+    const size_t outer = std::accumulate(
+        out_shapes.begin(), out_shapes.begin() + dim, size_t{1},
+        std::multiplies<size_t>());
 
+    size_t axis_offset = 0;
     for (const auto& t : tensors) {
-        size_t copy_size = t.size() * sizeof(float);
-        std::memcpy(dst_ptr + offset, t.raw_ptr(), copy_size);
-        offset += t.size();
+        const size_t chunk = static_cast<size_t>(t.shapes()[dim]) * inner;
+        for (size_t outer_index = 0; outer_index < outer; ++outer_index) {
+            const size_t destination = outer_index * out_shapes[dim] * inner + axis_offset;
+            const size_t source = outer_index * chunk;
+            std::memcpy(dst_ptr + destination, t.raw_ptr() + source,
+                        chunk * sizeof(float));
+        }
+        axis_offset += chunk;
     }
 
     return result;
 }
 
 std::vector<Tensor> split(const Tensor& tensor, uint32_t parts, uint32_t dim) {
+    if (parts == 0) {
+        throw std::invalid_argument("split: parts must be positive");
+    }
+    if (dim >= tensor.ndim()) {
+        throw std::out_of_range("split: dimension out of range");
+    }
     if (tensor.shapes()[dim] % parts != 0) {
         throw std::invalid_argument("split: dimension not evenly divisible");
     }
 
     std::vector<Tensor> results;
-    // 简化实现
-    // TODO: 实现完整的分割逻辑
+    results.reserve(parts);
+    std::vector<uint32_t> part_shape = tensor.shapes();
+    part_shape[dim] /= parts;
+    for (uint32_t part = 0; part < parts; ++part) {
+        results.emplace_back(part_shape, tensor.layout());
+    }
+
+    const size_t inner = std::accumulate(
+        tensor.shapes().begin() + dim + 1, tensor.shapes().end(), size_t{1},
+        std::multiplies<size_t>());
+    const size_t outer = std::accumulate(
+        tensor.shapes().begin(), tensor.shapes().begin() + dim, size_t{1},
+        std::multiplies<size_t>());
+    const size_t chunk = static_cast<size_t>(part_shape[dim]) * inner;
+    const size_t full_axis = static_cast<size_t>(tensor.shapes()[dim]) * inner;
+    for (size_t outer_index = 0; outer_index < outer; ++outer_index) {
+        for (uint32_t part = 0; part < parts; ++part) {
+            const size_t source = outer_index * full_axis + part * chunk;
+            const size_t destination = outer_index * chunk;
+            std::memcpy(results[part].raw_ptr() + destination,
+                        tensor.raw_ptr() + source, chunk * sizeof(float));
+        }
+    }
 
     return results;
 }

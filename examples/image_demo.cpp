@@ -108,12 +108,13 @@ void run_inference_benchmark(InferenceEngine& engine,
                             const Tensor& input,
                             int iterations)
 {
+    Tensor output({10});
     std::cout << "\n  Running " << iterations
               << " inference iterations...\n\n";
 
     // 预热
     for (int i = 0; i < 3; ++i) {
-        engine.infer(input);
+        engine.infer_into(input, output);
     }
 
     // 重置统计
@@ -123,7 +124,7 @@ void run_inference_benchmark(InferenceEngine& engine,
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        engine.infer(input);
+        engine.infer_into(input, output);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -152,7 +153,7 @@ int main(int argc, char** argv) {
     std::cout << "\n";
     std::cout << "╔════════════════════════════════════════════╗\n";
     std::cout << "║     MicroFlow MNIST Inference Demo        ║\n";
-    std::cout << "║     Raspberry Pi 4 Optimized              ║\n";
+    std::cout << "║     ROCK 4D / ARM64 Optimized             ║\n";
     std::cout << "╚════════════════════════════════════════════╝\n";
     std::cout << "\n";
 
@@ -269,7 +270,7 @@ int main(int argc, char** argv) {
  *
  * @section intro Introduction
  * MicroFlow is a lightweight neural network inference engine optimized
- * for Raspberry Pi 4 (Cortex-A72 ARM64 architecture).
+ * for ROCK 4D Cortex-A72 big cores (ARM64 architecture).
  *
  * @section features Features
  * - ARM NEON optimized kernels

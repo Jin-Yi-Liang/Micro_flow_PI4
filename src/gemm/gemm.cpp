@@ -4,6 +4,7 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 // ARM NEON头文件
 #if defined(__aarch64__) || defined(__arm__)
@@ -16,35 +17,276 @@
 
 namespace microflow {
 
-//==========================================================================
-// 硬件配置查询
-//==========================================================================
+namespace {
 
-/**
- * @brief 获取CPU L1缓存大小
- *
- * 树莓派4 (Cortex-A72): 48KB 数据缓存
- */
-static constexpr int get_l1_cache_size() {
-    return 48 * 1024;  // 48KB
+// Batch-1 fully-connected layers are GEMV operations. The generic 4x8
+// micro-kernel cannot be selected when M == 1, so the old implementation
+// fell through to a scalar edge path.
+void gemv_row_major(const float* a, const float* b, float* c, int n, int k) {
+    std::memset(c, 0, static_cast<size_t>(n) * sizeof(float));
+
+#ifdef MICROFLOW_HAS_NEON
+    const int vector_end = n & ~15;
+    const bool use_parallel = (static_cast<long long>(n) * k) >= 131072 && vector_end >= 32;
+
+    #pragma omp parallel for schedule(static) if(use_parallel)
+    for (int j = 0; j < vector_end; j += 16) {
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+        float32x4_t acc2 = vdupq_n_f32(0.0f);
+        float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+        for (int p = 0; p < k; ++p) {
+            const float value = a[p];
+            const float* row = b + static_cast<size_t>(p) * n + j;
+            acc0 = vmlaq_n_f32(acc0, vld1q_f32(row), value);
+            acc1 = vmlaq_n_f32(acc1, vld1q_f32(row + 4), value);
+            acc2 = vmlaq_n_f32(acc2, vld1q_f32(row + 8), value);
+            acc3 = vmlaq_n_f32(acc3, vld1q_f32(row + 12), value);
+        }
+
+        vst1q_f32(c + j, acc0);
+        vst1q_f32(c + j + 4, acc1);
+        vst1q_f32(c + j + 8, acc2);
+        vst1q_f32(c + j + 12, acc3);
+    }
+
+    int j = vector_end;
+    for (; j + 3 < n; j += 4) {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (int p = 0; p < k; ++p) {
+            acc = vmlaq_n_f32(acc,
+                              vld1q_f32(b + static_cast<size_t>(p) * n + j),
+                              a[p]);
+        }
+        vst1q_f32(c + j, acc);
+    }
+    for (; j < n; ++j) {
+        float sum = 0.0f;
+        for (int p = 0; p < k; ++p) {
+            sum += a[p] * b[static_cast<size_t>(p) * n + j];
+        }
+        c[j] = sum;
+    }
+#else
+    for (int p = 0; p < k; ++p) {
+        const float value = a[p];
+        const float* row = b + static_cast<size_t>(p) * n;
+        #pragma omp simd
+        for (int j = 0; j < n; ++j) {
+            c[j] += value * row[j];
+        }
+    }
+#endif
 }
 
-/**
- * @brief 获取CPU L2缓存大小
- *
- * 树莓派4 (Cortex-A72): 1MB 共享缓存
- */
-static constexpr int get_l2_cache_size() {
-    return 1024 * 1024;  // 1MB
+} // namespace
+
+void gemv_packed(const Tensor& input, const Tensor& packed_weights,
+                 const Tensor& bias, Tensor& output, bool apply_relu) {
+    const int out_features = static_cast<int>(packed_weights.shapes()[0]);
+    const int in_features = static_cast<int>(packed_weights.shapes()[1]);
+    const float* input_ptr = input.raw_ptr();
+    const float* weights_ptr = packed_weights.raw_ptr();
+    const float* bias_ptr = bias.is_valid() ? bias.raw_ptr() : nullptr;
+    float* output_ptr = output.raw_ptr();
+    const bool use_parallel =
+        static_cast<long long>(out_features) * in_features >= 131072;
+
+#ifdef MICROFLOW_HAS_NEON
+    const int block_end = out_features & ~3;
+    #pragma omp parallel for schedule(static) if(use_parallel)
+    for (int output_index = 0; output_index < block_end; output_index += 4) {
+        const float* w0 = weights_ptr + static_cast<size_t>(output_index) * in_features;
+        const float* w1 = w0 + in_features;
+        const float* w2 = w1 + in_features;
+        const float* w3 = w2 + in_features;
+        float32x4_t a00 = vdupq_n_f32(0.0f), a01 = vdupq_n_f32(0.0f);
+        float32x4_t a02 = vdupq_n_f32(0.0f), a03 = vdupq_n_f32(0.0f);
+        float32x4_t a10 = vdupq_n_f32(0.0f), a11 = vdupq_n_f32(0.0f);
+        float32x4_t a12 = vdupq_n_f32(0.0f), a13 = vdupq_n_f32(0.0f);
+        float32x4_t a20 = vdupq_n_f32(0.0f), a21 = vdupq_n_f32(0.0f);
+        float32x4_t a22 = vdupq_n_f32(0.0f), a23 = vdupq_n_f32(0.0f);
+        float32x4_t a30 = vdupq_n_f32(0.0f), a31 = vdupq_n_f32(0.0f);
+        float32x4_t a32 = vdupq_n_f32(0.0f), a33 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 15 < in_features; i += 16) {
+            const float32x4_t x0 = vld1q_f32(input_ptr + i);
+            const float32x4_t x1 = vld1q_f32(input_ptr + i + 4);
+            const float32x4_t x2 = vld1q_f32(input_ptr + i + 8);
+            const float32x4_t x3 = vld1q_f32(input_ptr + i + 12);
+            a00 = vfmaq_f32(a00, x0, vld1q_f32(w0 + i));
+            a01 = vfmaq_f32(a01, x1, vld1q_f32(w0 + i + 4));
+            a02 = vfmaq_f32(a02, x2, vld1q_f32(w0 + i + 8));
+            a03 = vfmaq_f32(a03, x3, vld1q_f32(w0 + i + 12));
+            a10 = vfmaq_f32(a10, x0, vld1q_f32(w1 + i));
+            a11 = vfmaq_f32(a11, x1, vld1q_f32(w1 + i + 4));
+            a12 = vfmaq_f32(a12, x2, vld1q_f32(w1 + i + 8));
+            a13 = vfmaq_f32(a13, x3, vld1q_f32(w1 + i + 12));
+            a20 = vfmaq_f32(a20, x0, vld1q_f32(w2 + i));
+            a21 = vfmaq_f32(a21, x1, vld1q_f32(w2 + i + 4));
+            a22 = vfmaq_f32(a22, x2, vld1q_f32(w2 + i + 8));
+            a23 = vfmaq_f32(a23, x3, vld1q_f32(w2 + i + 12));
+            a30 = vfmaq_f32(a30, x0, vld1q_f32(w3 + i));
+            a31 = vfmaq_f32(a31, x1, vld1q_f32(w3 + i + 4));
+            a32 = vfmaq_f32(a32, x2, vld1q_f32(w3 + i + 8));
+            a33 = vfmaq_f32(a33, x3, vld1q_f32(w3 + i + 12));
+        }
+        float sums[4] = {
+            (bias_ptr ? bias_ptr[output_index] : 0.0f) +
+                vaddvq_f32(vaddq_f32(vaddq_f32(a00, a01), vaddq_f32(a02, a03))),
+            (bias_ptr ? bias_ptr[output_index + 1] : 0.0f) +
+                vaddvq_f32(vaddq_f32(vaddq_f32(a10, a11), vaddq_f32(a12, a13))),
+            (bias_ptr ? bias_ptr[output_index + 2] : 0.0f) +
+                vaddvq_f32(vaddq_f32(vaddq_f32(a20, a21), vaddq_f32(a22, a23))),
+            (bias_ptr ? bias_ptr[output_index + 3] : 0.0f) +
+                vaddvq_f32(vaddq_f32(vaddq_f32(a30, a31), vaddq_f32(a32, a33))),
+        };
+        for (; i < in_features; ++i) {
+            const float value = input_ptr[i];
+            sums[0] += value * w0[i];
+            sums[1] += value * w1[i];
+            sums[2] += value * w2[i];
+            sums[3] += value * w3[i];
+        }
+        for (int lane = 0; lane < 4; ++lane) {
+            output_ptr[output_index + lane] =
+                apply_relu ? std::max(sums[lane], 0.0f) : sums[lane];
+        }
+    }
+    for (int output_index = block_end; output_index < out_features; ++output_index) {
+        const float* weights = weights_ptr + static_cast<size_t>(output_index) * in_features;
+        float sum = bias_ptr ? bias_ptr[output_index] : 0.0f;
+        float32x4_t accumulator = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 3 < in_features; i += 4) {
+            accumulator = vfmaq_f32(accumulator, vld1q_f32(input_ptr + i),
+                                    vld1q_f32(weights + i));
+        }
+        sum += vaddvq_f32(accumulator);
+        for (; i < in_features; ++i) sum += input_ptr[i] * weights[i];
+        output_ptr[output_index] = apply_relu ? std::max(sum, 0.0f) : sum;
+    }
+#else
+    #pragma omp parallel for schedule(static) if(use_parallel)
+    for (int output_index = 0; output_index < out_features; ++output_index) {
+        const float* weights = weights_ptr + static_cast<size_t>(output_index) * in_features;
+        float sum = bias_ptr ? bias_ptr[output_index] : 0.0f;
+        #pragma omp simd reduction(+:sum)
+        for (int i = 0; i < in_features; ++i) {
+            sum += input_ptr[i] * weights[i];
+        }
+        output_ptr[output_index] = apply_relu ? std::max(sum, 0.0f) : sum;
+    }
+#endif
 }
 
-/**
- * @brief 获取缓存行大小
- *
- * ARMv8: 64字节
- */
-static constexpr int get_cache_line_size() {
-    return 64;
+void gemv_int8_dynamic(const Tensor& input,
+                       const std::vector<int8_t>& packed_weights,
+                       const std::vector<float>& weight_scales,
+                       const std::vector<int32_t>& weight_sums,
+                       const Tensor& bias,
+                       Tensor& output,
+                       bool apply_relu,
+                       std::vector<int8_t>& input_buffer) {
+    const int in_features = static_cast<int>(input.size());
+    const int out_features = static_cast<int>(output.size());
+    constexpr int block_size = 64;
+    const int blocks = (in_features + block_size - 1) / block_size;
+    const float* input_ptr = input.raw_ptr();
+    input_buffer.resize(in_features);
+
+    float max_value = 0.0f;
+    float min_value = 0.0f;
+#ifdef MICROFLOW_HAS_NEON
+    float32x4_t maximum = vdupq_n_f32(0.0f);
+    float32x4_t minimum = vdupq_n_f32(0.0f);
+    int input_index = 0;
+    for (; input_index + 3 < in_features; input_index += 4) {
+        maximum = vmaxq_f32(maximum, vabsq_f32(vld1q_f32(input_ptr + input_index)));
+        minimum = vminq_f32(minimum, vld1q_f32(input_ptr + input_index));
+    }
+    max_value = vmaxvq_f32(maximum);
+    min_value = vminvq_f32(minimum);
+    for (; input_index < in_features; ++input_index) {
+        max_value = std::max(max_value, std::abs(input_ptr[input_index]));
+        min_value = std::min(min_value, input_ptr[input_index]);
+    }
+#else
+    for (int i = 0; i < in_features; ++i) {
+        max_value = std::max(max_value, std::abs(input_ptr[i]));
+        min_value = std::min(min_value, input_ptr[i]);
+    }
+#endif
+    // ReLU outputs are non-negative, so use all 256 signed-int8 codes with
+    // zero represented by -128. This doubles activation resolution compared
+    // with symmetric quantization while retaining the same NEON kernel.
+    const int zero_point = min_value >= 0.0f ? -128 : 0;
+    const float levels = zero_point == -128 ? 255.0f : 127.0f;
+    const float input_scale = max_value > 0.0f ? max_value / levels : 1.0f;
+    const float inverse_scale = 1.0f / input_scale;
+
+#ifdef MICROFLOW_HAS_NEON
+    const float32x4_t multiplier = vdupq_n_f32(inverse_scale);
+    const int32x4_t offset = vdupq_n_s32(zero_point);
+    int i = 0;
+    for (; i + 7 < in_features; i += 8) {
+        const int32x4_t q0 = vaddq_s32(
+            vcvtnq_s32_f32(vmulq_f32(vld1q_f32(input_ptr + i), multiplier)), offset);
+        const int32x4_t q1 = vaddq_s32(
+            vcvtnq_s32_f32(vmulq_f32(vld1q_f32(input_ptr + i + 4), multiplier)), offset);
+        const int16x8_t q16 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+        vst1_s8(input_buffer.data() + i, vqmovn_s16(q16));
+    }
+    for (; i < in_features; ++i) {
+        const long value = std::lrint(input_ptr[i] * inverse_scale) + zero_point;
+        input_buffer[i] = static_cast<int8_t>(std::clamp(value, -128L, 127L));
+    }
+#else
+    for (int i = 0; i < in_features; ++i) {
+        const long value = std::lrint(input_ptr[i] * inverse_scale) + zero_point;
+        input_buffer[i] = static_cast<int8_t>(std::clamp(value, -128L, 127L));
+    }
+#endif
+
+    const float* bias_ptr = bias.is_valid() ? bias.raw_ptr() : nullptr;
+    float* output_ptr = output.raw_ptr();
+    const bool use_parallel =
+        static_cast<long long>(out_features) * in_features >= 131072;
+    #pragma omp parallel for schedule(static) if(use_parallel)
+    for (int output_index = 0; output_index < out_features; ++output_index) {
+        const int8_t* weights = packed_weights.data() +
+            static_cast<size_t>(output_index) * in_features;
+        float accumulated = 0.0f;
+        for (int block = 0; block < blocks; ++block) {
+        const int begin = block * block_size;
+        const int end = std::min(begin + block_size, in_features);
+        int32_t dot = 0;
+#ifdef MICROFLOW_HAS_NEON
+        int32x4_t accumulator = vdupq_n_s32(0);
+        int k = begin;
+        for (; k + 15 < end; k += 16) {
+            const int8x16_t x = vld1q_s8(input_buffer.data() + k);
+            const int8x16_t w = vld1q_s8(weights + k);
+            accumulator = vpadalq_s16(accumulator,
+                                      vmull_s8(vget_low_s8(x), vget_low_s8(w)));
+            accumulator = vpadalq_s16(accumulator,
+                                      vmull_s8(vget_high_s8(x), vget_high_s8(w)));
+        }
+        dot = vaddvq_s32(accumulator);
+        for (; k < end; ++k) dot += input_buffer[k] * weights[k];
+#else
+        #pragma omp simd reduction(+:dot)
+        for (int k = begin; k < end; ++k) dot += input_buffer[k] * weights[k];
+#endif
+        const size_t scale_index = static_cast<size_t>(output_index) * blocks + block;
+        dot -= zero_point * weight_sums[scale_index];
+        accumulated += static_cast<float>(dot) * weight_scales[scale_index];
+        }
+        float value = accumulated * input_scale +
+                      (bias_ptr ? bias_ptr[output_index] : 0.0f);
+        output_ptr[output_index] = apply_relu ? std::max(value, 0.0f) : value;
+    }
 }
 
 //==========================================================================
@@ -56,9 +298,6 @@ GEMMConfig get_optimal_config(int M, int N, int K) {
 
     // 根据矩阵大小调整分块参数
     // 目标: 每个块能放入L1缓存
-
-    int l1_size = get_l1_cache_size();
-    int l2_size = get_l2_cache_size();
 
     // mc * kc * sizeof(float) < L1 / 3 (给A, B, C各留空间)
     // 48KB / 3 ≈ 16KB = 4096 floats
@@ -354,17 +593,17 @@ void gemm_neon(const Tensor& A, const Tensor& B, Tensor& C,
                const GEMMConfig& config)
 {
     int M = A.shapes()[0];
-    int K = A.shapes()[1];
     int N = B.shapes()[1];
 
-    const float* ptr_A = A.raw_ptr();
-    const float* ptr_B = B.raw_ptr();
     float* ptr_C = C.raw_ptr();
 
     // 清零C矩阵
     std::memset(ptr_C, 0, M * N * sizeof(float));
 
 #ifdef MICROFLOW_HAS_NEON
+    const int K = A.shapes()[1];
+    const float* ptr_A = A.raw_ptr();
+    const float* ptr_B = B.raw_ptr();
     // 分块参数
     const int mc = config.mc;  // M分块
     const int nc = config.nc;  // N分块
@@ -441,6 +680,11 @@ void gemm(const Tensor& A, const Tensor& B, Tensor& C,
     int M = A.shapes()[0];
     int N = B.shapes()[1];
     int K = A.shapes()[1];
+
+    if (M == 1) {
+        gemv_row_major(A.raw_ptr(), B.raw_ptr(), C.raw_ptr(), N, K);
+        return;
+    }
 
     // 自动选择实现
     GEMMImpl impl = select_best_implementation(M, N, K);
